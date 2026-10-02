@@ -16,7 +16,10 @@ permissions:
 
 concurrency:
   group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
-  cancel-in-progress: false
+  # Supersede an in-flight run for the same tag. With this disabled, re-pushing
+  # a tag queues the new run behind the old one instead of replacing it, so a
+  # single stalled job blocks every later release attempt for that ref.
+  cancel-in-progress: true
 
 jobs:
   prepare:
