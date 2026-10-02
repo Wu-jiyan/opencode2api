@@ -1,0 +1,20 @@
+{
+  "name": "opencode2api-dev",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "naive-ui": "^2.41.0",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "prettier": "3.9.6",
+    "vite": "^6.0.7"
+  }
+}
