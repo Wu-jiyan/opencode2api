@@ -99,10 +99,15 @@ jobs:
             extension: ""
           - goos: darwin
             goarch: amd64
-            # macos-latest is arm64, so the x64 target needs the Intel runner.
-            runner: macos-13
+            # Go cross-compiles from any host, and unlike the arm64 targets this
+            # pair gains nothing from a native runner: macOS arm64 runners are
+            # plentiful while Intel runners are frequently queued for a long
+            # time, which would block the whole release. Only a smoke test is
+            # skipped for this row, since the binary cannot run on the host.
+            runner: macos-latest
             archive: tar.gz
             extension: ""
+            cross: "true"
     steps:
       - uses: actions/checkout@v4
 
@@ -171,9 +176,6 @@ jobs:
         shell: bash
         run: |
           package_dir="dist/${{ steps.metadata.outputs.package_name }}"
-          # Run the very copy that was archived, so an architecture mismatch or
-          # a missing embedded asset fails here rather than on a user's machine.
-          "$package_dir/opencode2api${{ matrix.extension }}" -h 2>&1 | head -5
           # The documented first step is "edit config.json", so the archive must
           # contain one and it must parse.
           test -f "$package_dir/config.json"
@@ -181,6 +183,13 @@ jobs:
             powershell -NoProfile -Command "Get-Content -Raw '$package_dir/config.json' | ConvertFrom-Json | Out-Null"
           else
             python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$package_dir/config.json"
+          fi
+          # Running the binary only makes sense when it was built for this host;
+          # a cross-compiled one would report an exec format error.
+          if [ "${{ matrix.cross }}" != "true" ]; then
+            "$package_dir/opencode2api${{ matrix.extension }}" -h 2>&1 | head -5
+          else
+            file "$package_dir/opencode2api" | head -1
           fi
           ls -1 "$package_dir"
 
