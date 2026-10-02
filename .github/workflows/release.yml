@@ -126,14 +126,31 @@ jobs:
           RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
           PACKAGE_NAME: ${{ steps.metadata.outputs.package_name }}
           ARCHIVE_FORMAT: ${{ matrix.archive }}
+          GOOS: ${{ matrix.goos }}
+          EXTENSION: ${{ matrix.extension }}
         run: |
-          mkdir -p "dist/$PACKAGE_NAME"
+          package_dir="dist/$PACKAGE_NAME"
+          mkdir -p "$package_dir"
           # GOOS and GOARCH are both set explicitly so the artifact always
           # matches the label, independently of the runner it was built on.
-          GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" \
+          GOOS="$GOOS" GOARCH="${{ matrix.goarch }}" \
             go build -trimpath -ldflags="-s -w -X main.version=$RELEASE_TAG" \
-            -o "dist/$PACKAGE_NAME/opencode2api${{ matrix.extension }}" ./cmd/opencode2api
-          cp README.md README.zh-CN.md config.example.json "dist/$PACKAGE_NAME/"
+            -o "$package_dir/opencode2api$EXTENSION" ./cmd/opencode2api
+
+          # Ship a ready-to-edit config.json so the archive works without a copy
+          # step. It only ever holds the placeholders from config.example.json,
+          # and config.json itself stays git-ignored.
+          cp config.example.json "$package_dir/config.json"
+
+          cp README.md README.zh-CN.md DEPLOYMENT.md "$package_dir/"
+
+          if [ "$EXTENSION" = ".exe" ]; then
+            cp start.bat "$package_dir/"
+          else
+            cp start.sh "$package_dir/"
+            chmod +x "$package_dir/start.sh" "$package_dir/opencode2api"
+          fi
+
           if [ "$ARCHIVE_FORMAT" = "zip" ]; then
             (cd dist && zip -q -r "$PACKAGE_NAME.zip" "$PACKAGE_NAME")
             archive="$PACKAGE_NAME.zip"
@@ -143,12 +160,22 @@ jobs:
           fi
           (cd dist && sha256sum "$archive" > "$archive.sha256")
 
-      - name: Smoke test the native binary
+      - name: Smoke test the packaged archive
         shell: bash
         run: |
-          # A native build should at least be able to print its version banner;
-          # an emulated or mismatched binary would fail here.
-          ./dist/"${{ steps.metadata.outputs.package_name }}"/opencode2api${{ matrix.extension }} -h 2>&1 | head -5
+          package_dir="dist/${{ steps.metadata.outputs.package_name }}"
+          # Run the very copy that was archived, so an architecture mismatch or
+          # a missing embedded asset fails here rather than on a user's machine.
+          "$package_dir/opencode2api${{ matrix.extension }}" -h 2>&1 | head -5
+          # The documented first step is "edit config.json", so the archive must
+          # contain one and it must parse.
+          test -f "$package_dir/config.json"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            powershell -NoProfile -Command "Get-Content -Raw '$package_dir/config.json' | ConvertFrom-Json | Out-Null"
+          else
+            python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$package_dir/config.json"
+          fi
+          ls -1 "$package_dir"
 
       - name: Upload release files
         uses: actions/upload-artifact@v4

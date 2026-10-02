@@ -14,12 +14,15 @@ if not exist "%BINARY%" (
 
 if not exist "%CONFIG%" (
     echo [ERROR] %CONFIG% not found in "%CD%"
+    echo HINT: create %CONFIG% from config.example.json and replace the placeholder keys.
     pause
     exit /b 1
 )
 
+rem A missing Xray is not fatal: with vless.auto_download_xray enabled the
+rem gateway fetches it in the background on first start.
 if not exist "bin\xray\xray.exe" (
-    echo [WARN] bin\xray\xray.exe not found - the vless proxy pool will not start
+    echo [WARN] Xray not found locally; it will be downloaded automatically if vless.auto_download_xray is enabled.
     echo.
 )
 

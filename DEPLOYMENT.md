@@ -115,44 +115,97 @@ docker run -d --name opencode2api \
 
 适合不想装 Docker 的服务器。从 [Releases](https://github.com/Wu-jiyan/opencode2api/releases) 下载对应平台的压缩包，每个包都附带 `.sha256` 校验文件。
 
+### 压缩包里有什么
+
+每个平台压缩包解压后是一个自包含目录：
+
+```text
+opencode2api_v1.0.0_linux_amd64/
+  opencode2api          # 对应平台的可执行文件（Windows 为 opencode2api.exe）
+  config.json           # 已填好占位符，直接改就能用
+  start.sh              # 启动脚本（Windows 包内为 start.bat）
+  README.md
+  README.zh-CN.md
+  DEPLOYMENT.md         # 本文档
+```
+
+`config.json` 由 `config.example.json` 复制而来，只含占位符，**不含任何真实凭据**，可以直接编辑后启动，无需再做 `cp`。
+
+### 三个必改项
+
+解压后打开 `config.json`，至少改这三处，否则服务无法正常使用：
+
+| 字段             | 当前占位值                   | 改成什么                                                          |
+| ---------------- | ---------------------------- | ----------------------------------------------------------------- |
+| `server_keys`    | `change-this-local-key`      | 你自己的本地 API Key，客户端调用时用                              |
+| `zen_keys`       | `sk-your-zen-key`            | 你的 Zen Key；或改用 `go_keys`；或设 `anonymous: true` 并清空两者 |
+| `webui.password` | `change-this-admin-password` | 至少 10 位的强密码                                                |
+
+改完直接启动：
+
+```bash
+./start.sh
+```
+
+`start.sh` 会在启动前检查可执行文件与 `config.json` 是否就绪；缺少 Xray 只提示不阻塞，因为启用 vless 时它会被自动下载。
+
 ### Linux (amd64)
 
 ```bash
 VERSION=v1.0.0
-curl -LO "https://github.com/Wu-jiyan/opencode2api/releases/download/${VERSION}/opencode2api_${VERSION}_linux_amd64.tar.gz"
-curl -LO "https://github.com/Wu-jiyan/opencode2api/releases/download/${VERSION}/opencode2api_${VERSION}_linux_amd64.tar.gz.sha256"
+ARCH=linux_amd64
+curl -LO "https://github.com/Wu-jiyan/opencode2api/releases/download/${VERSION}/opencode2api_${VERSION}_${ARCH}.tar.gz"
+curl -LO "https://github.com/Wu-jiyan/opencode2api/releases/download/${VERSION}/opencode2api_${VERSION}_${ARCH}.tar.gz.sha256"
 
 # 校验完整性，务必先做这一步
-sha256sum -c "opencode2api_${VERSION}_linux_amd64.tar.gz.sha256"
+sha256sum -c "opencode2api_${VERSION}_${ARCH}.tar.gz.sha256"
 
-tar -xzf "opencode2api_${VERSION}_linux_amd64.tar.gz"
-cd "opencode2api_${VERSION}_linux_amd64"
-cp config.example.json config.json
+tar -xzf "opencode2api_${VERSION}_${ARCH}.tar.gz"
+cd "opencode2api_${VERSION}_${ARCH}"
+vi config.json     # 改上面三个字段
+./start.sh
 ```
 
 ### Linux (arm64)
 
-把上面的 `linux_amd64` 换成 `linux_arm64` 即可，适用于树莓派 4/5、各类 ARM 云服务器。
+把 `ARCH` 换成 `linux_arm64`，适用于树莓派 4/5、各类 ARM 云服务器（原生构建，无模拟开销）。
 
 ### macOS
 
 ```bash
 VERSION=v1.0.0
-curl -LO "https://github.com/Wu-jiyan/opencode2api/releases/download/${VERSION}/opencode2api_${VERSION}_darwin_arm64.tar.gz"
-sha256sum -c "opencode2api_${VERSION}_darwin_arm64.tar.gz.sha256"   # macOS: shasum -a 256
-tar -xzf "opencode2api_${VERSION}_darwin_arm64.tar.gz"
+ARCH=darwin_arm64      # Apple Silicon；Intel Mac 用 darwin_amd64
+curl -LO "https://github.com/Wu-jiyan/opencode2api/releases/download/${VERSION}/opencode2api_${VERSION}_${ARCH}.tar.gz"
+shasum -a 256 -c "opencode2api_${VERSION}_${ARCH}.tar.gz.sha256"   # macOS 用 shasum
+tar -xzf "opencode2api_${VERSION}_${ARCH}.tar.gz"
+cd "opencode2api_${VERSION}_${ARCH}"
+vi config.json
+./start.sh
 ```
-
-Apple Silicon 用 `darwin_arm64`，Intel Mac 用 `darwin_amd64`。
 
 ### Windows
 
-下载 `opencode2api_<版本>_windows_amd64.zip`，解压后把 `config.example.json` 复制为 `config.json`。校验：
+下载 `opencode2api_<版本>_windows_amd64.zip`（ARM 机器用 `windows_arm64`），校验后解压：
 
 ```powershell
 Get-FileHash "opencode2api_v1.0.0_windows_amd64.zip" -Algorithm SHA256
 # 与同名 .sha256 文件里的字符串比对
+
+Expand-Archive opencode2api_v1.0.0_windows_amd64.zip
+cd opencode2api_v1.0.0_windows_amd64
+notepad config.json    # 改上面三个字段
+.\start.bat
 ```
+
+### 可用平台
+
+| 平台    | amd64 | arm64 |
+| ------- | ----- | ----- |
+| Linux   | ✅    | ✅    |
+| Windows | ✅    | ✅    |
+| macOS   | ✅    | ✅    |
+
+六个平台均在对应的**原生 runner** 上构建（Linux ARM 用 `ubuntu-24.04-arm`，Windows ARM 用 `windows-11-arm`），不做交叉编译或指令集模拟。
 
 ### systemd 常驻（Linux 推荐）
 
@@ -205,6 +258,8 @@ git clone https://github.com/Wu-jiyan/opencode2api.git
 cd opencode2api
 cp config.example.json config.json
 go build -o opencode2api ./cmd/opencode2api
+vi config.json
+./start.sh
 ```
 
 国内网络建议先配置 Go 模块镜像，否则拉依赖会很慢：
@@ -222,7 +277,7 @@ go build -o opencode2api.exe ./cmd/opencode2api
 .\start.bat
 ```
 
-`start.bat` 会在启动前检查二进制、`config.json` 与 Xray 是否就绪，缺少 Xray 只警告不阻塞。
+`start.sh` 与 `start.bat` 作用相同：启动前检查可执行文件与 `config.json` 是否就绪，缺少 Xray 只提示不阻塞（启用 vless 时会自动下载）。额外参数会透传给网关，例如 `./start.sh -listen 0.0.0.0:9000`。
 
 > **前端产物说明**：`webui/dist` 已随仓库提交并内嵌进二进制，所以编译网关**不需要 Node.js**。只有修改了 `webui/src/` 下的前端源码时，才需要先重新构建：
 >
