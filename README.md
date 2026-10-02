@@ -42,7 +42,7 @@ Edit `config.json` before starting:
 ./opencode2api -config config.json
 ```
 
-On Windows, copy the config with `Copy-Item config.example.json config.json`, build with `go build -o opencode2api.exe ./cmd/opencode2api`, and run `.\opencode2api.exe -config config.json`. The bundled `start.bat` checks that the binary, the configuration, and Xray are present before launching.
+On Windows, copy the config with `Copy-Item config.example.json config.json`, build with `go build -o opencode2api.exe ./cmd/opencode2api`, and run `.\opencode2api.exe -config config.json`.
 
 The example listens on `127.0.0.1:8080` for the API and `0.0.0.0:8081` for the WebUI. Open `http://localhost:8081` locally. **When reaching the console over a network, restrict access and put it behind an HTTPS reverse proxy** — the console has a single shared administrator account and its login throttling is kept in memory rather than persisted.
 

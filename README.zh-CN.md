@@ -42,7 +42,7 @@ go build -o opencode2api ./cmd/opencode2api
 ./opencode2api -config config.json
 ```
 
-Windows 下使用 `Copy-Item config.example.json config.json` 复制配置，编译为 `go build -o opencode2api.exe ./cmd/opencode2api`，然后运行 `.\opencode2api.exe -config config.json`；仓库中附带的 `start.bat` 会替你检查二进制、配置与 Xray 是否就绪后再启动。
+Windows 下使用 `Copy-Item config.example.json config.json` 复制配置，编译为 `go build -o opencode2api.exe ./cmd/opencode2api`，然后运行 `.\opencode2api.exe -config config.json`。
 
 示例配置的 API 监听 `127.0.0.1:8080`，WebUI 监听 `0.0.0.0:8081`。本机访问 `http://localhost:8081`。**通过网络访问管理端时，请务必限制访问范围并使用 HTTPS 反向代理** —— 管理端只有一个共享账号，且限速是按内存记录而非持久化的。
 

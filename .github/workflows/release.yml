@@ -139,16 +139,15 @@ jobs:
 
           # Ship a ready-to-edit config.json so the archive works without a copy
           # step. It only ever holds the placeholders from config.example.json,
-          # and config.json itself stays git-ignored.
+          # and config.json itself stays git-ignored. No launcher script is
+          # bundled: a batch file would need a specific code page to stay
+          # readable, so users run the binary directly instead.
           cp config.example.json "$package_dir/config.json"
 
           cp README.md README.zh-CN.md DEPLOYMENT.md "$package_dir/"
 
-          if [ "$EXTENSION" = ".exe" ]; then
-            cp start.bat "$package_dir/"
-          else
-            cp start.sh "$package_dir/"
-            chmod +x "$package_dir/start.sh" "$package_dir/opencode2api"
+          if [ "$EXTENSION" != ".exe" ]; then
+            chmod +x "$package_dir/opencode2api"
           fi
 
           if [ "$ARCHIVE_FORMAT" = "zip" ]; then

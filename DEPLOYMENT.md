@@ -123,13 +123,19 @@ docker run -d --name opencode2api \
 opencode2api_v1.0.0_linux_amd64/
   opencode2api          # 对应平台的可执行文件（Windows 为 opencode2api.exe）
   config.json           # 已填好占位符，直接改就能用
-  start.sh              # 启动脚本（Windows 包内为 start.bat）
   README.md
   README.zh-CN.md
   DEPLOYMENT.md         # 本文档
 ```
 
 `config.json` 由 `config.example.json` 复制而来，只含占位符，**不含任何真实凭据**，可以直接编辑后启动，无需再做 `cp`。
+
+压缩包内**不含启动脚本**。批处理文件在不同代码页下容易出现乱码，因此请直接运行二进制：
+
+```bash
+./opencode2api -config config.json        # Linux / macOS
+.\opencode2api.exe -config config.json    # Windows
+```
 
 ### 三个必改项
 
@@ -141,13 +147,7 @@ opencode2api_v1.0.0_linux_amd64/
 | `zen_keys`       | `sk-your-zen-key`            | 你的 Zen Key；或改用 `go_keys`；或设 `anonymous: true` 并清空两者 |
 | `webui.password` | `change-this-admin-password` | 至少 10 位的强密码                                                |
 
-改完直接启动：
-
-```bash
-./start.sh
-```
-
-`start.sh` 会在启动前检查可执行文件与 `config.json` 是否就绪；缺少 Xray 只提示不阻塞，因为启用 vless 时它会被自动下载。
+改完直接启动即可。启用 vless 但本地没有 Xray 时也不用管，服务会在后台自动下载。
 
 ### Linux (amd64)
 
@@ -163,7 +163,7 @@ sha256sum -c "opencode2api_${VERSION}_${ARCH}.tar.gz.sha256"
 tar -xzf "opencode2api_${VERSION}_${ARCH}.tar.gz"
 cd "opencode2api_${VERSION}_${ARCH}"
 vi config.json     # 改上面三个字段
-./start.sh
+./opencode2api -config config.json
 ```
 
 ### Linux (arm64)
@@ -180,7 +180,7 @@ shasum -a 256 -c "opencode2api_${VERSION}_${ARCH}.tar.gz.sha256"   # macOS 用 s
 tar -xzf "opencode2api_${VERSION}_${ARCH}.tar.gz"
 cd "opencode2api_${VERSION}_${ARCH}"
 vi config.json
-./start.sh
+./opencode2api -config config.json
 ```
 
 ### Windows
@@ -194,7 +194,7 @@ Get-FileHash "opencode2api_v1.0.0_windows_amd64.zip" -Algorithm SHA256
 Expand-Archive opencode2api_v1.0.0_windows_amd64.zip
 cd opencode2api_v1.0.0_windows_amd64
 notepad config.json    # 改上面三个字段
-.\start.bat
+.\opencode2api.exe -config config.json
 ```
 
 ### 可用平台
@@ -259,7 +259,7 @@ cd opencode2api
 cp config.example.json config.json
 go build -o opencode2api ./cmd/opencode2api
 vi config.json
-./start.sh
+./opencode2api -config config.json
 ```
 
 国内网络建议先配置 Go 模块镜像，否则拉依赖会很慢：
@@ -274,10 +274,16 @@ Windows 下：
 ```powershell
 Copy-Item config.example.json config.json
 go build -o opencode2api.exe ./cmd/opencode2api
-.\start.bat
+.\opencode2api.exe -config config.json
 ```
 
-`start.sh` 与 `start.bat` 作用相同：启动前检查可执行文件与 `config.json` 是否就绪，缺少 Xray 只提示不阻塞（启用 vless 时会自动下载）。额外参数会透传给网关，例如 `./start.sh -listen 0.0.0.0:9000`。
+命令行参数：
+
+| 参数          | 默认值        | 用途                  |
+| ------------- | ------------- | --------------------- |
+| `-config`     | `config.json` | 配置文件路径。        |
+| `-listen`     | 未设置        | 覆盖 API 监听地址。   |
+| `-web-listen` | 未设置        | 覆盖 WebUI 监听地址。 |
 
 > **前端产物说明**：`webui/dist` 已随仓库提交并内嵌进二进制，所以编译网关**不需要 Node.js**。只有修改了 `webui/src/` 下的前端源码时，才需要先重新构建：
 >
