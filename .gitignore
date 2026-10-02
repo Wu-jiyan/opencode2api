@@ -1,0 +1,38 @@
+# 运行时配置与密钥
+config.json
+config.json.bak
+.config-*.tmp
+.key
+*.key
+
+# 模型与价格目录缓存（文件名基于配置路径生成）
+*.models.catalog.json
+*.models.dev.json
+
+# vless 代理池：Xray 可执行文件与 geo 数据随订阅分发，不入库
+/vless/
+/bin/
+
+# 本地构建产物（webui/dist 例外：它随仓库提交并内嵌进可执行文件）
+/opencode2api
+/opencode2api.exe
+/opencode2api*.zip
+/opencode2api*.tar.gz
+/dist/
+
+# 依赖与缓存目录
+node_modules/
+.tmp/
+.gocache/
+
+# 日志与测试产物
+*.log
+coverage.out
+*.test
+*.test.exe
+
+# 编辑器与系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
