@@ -151,13 +151,21 @@ jobs:
           fi
 
           if [ "$ARCHIVE_FORMAT" = "zip" ]; then
-            (cd dist && zip -q -r "$PACKAGE_NAME.zip" "$PACKAGE_NAME")
+            # zip and sha256sum are absent on the Windows runners, so the
+            # archive is produced by PowerShell and hashed with Get-FileHash.
+            powershell -NoProfile -Command "Compress-Archive -Path 'dist/$PACKAGE_NAME' -DestinationPath 'dist/$PACKAGE_NAME.zip' -Force"
             archive="$PACKAGE_NAME.zip"
           else
             tar -C dist -czf "dist/$PACKAGE_NAME.tar.gz" "$PACKAGE_NAME"
             archive="$PACKAGE_NAME.tar.gz"
           fi
-          (cd dist && sha256sum "$archive" > "$archive.sha256")
+
+          if [ "$GOOS" = "windows" ]; then
+            digest="$(powershell -NoProfile -Command "(Get-FileHash -Algorithm SHA256 'dist/$archive').Hash.ToLower()")"
+            printf '%s  %s\n' "$digest" "$archive" > "dist/$archive.sha256"
+          else
+            (cd dist && sha256sum "$archive" > "$archive.sha256")
+          fi
 
       - name: Smoke test the packaged archive
         shell: bash
