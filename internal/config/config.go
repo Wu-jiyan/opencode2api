@@ -69,8 +69,23 @@ type UpstreamConfig struct {
 type VlessConfig struct {
 	Enabled bool `json:"enabled"`
 	// Subscription is an http(s) URL returning either a base64 v2ray
-	// subscription or a Clash/mihomo YAML proxy list.
+	// subscription or a Clash/mihomo YAML proxy list. It is optional when
+	// Nodes supplies every candidate, so a fixed-node setup needs no URL.
 	Subscription string `json:"subscription"`
+	// Nodes are fixed vless:// share links used instead of, or alongside, a
+	// subscription. A link whose address is a Cloudflare preferred domain is
+	// expanded across PreferredDomains, which is how one fixed node yields
+	// several independent outbound routes.
+	Nodes []string `json:"nodes"`
+	// PreferredDomains are Cloudflare preferred domains (or hand-picked IPs) to
+	// substitute for a node's address. The rest of the link — UUID, SNI, host,
+	// path, transport — is preserved, because only the edge address changes.
+	PreferredDomains []string `json:"preferred_domains"`
+	// Endpoints are alternative origins for the same service, for example
+	// several edn2/edn3-style hostnames. Candidates receive them round-robin so
+	// each origin's request budget is spent at an even rate instead of draining
+	// the first one. Empty keeps every candidate on the host its link named.
+	Endpoints []string `json:"endpoints"`
 	// Count is how many local listeners stay alive at once.
 	Count int `json:"count"`
 	// RefreshSeconds is the base interval of the rolling rebuild loop.
@@ -314,18 +329,34 @@ func normalizeVless(cfg *Config) error {
 	cfg.Vless.XrayVersion = strings.TrimSpace(cfg.Vless.XrayVersion)
 	cfg.Vless.Host = strings.TrimSpace(cfg.Vless.Host)
 	cfg.Vless.SubscriptionProxy = strings.TrimSpace(cfg.Vless.SubscriptionProxy)
+	trimList(&cfg.Vless.Nodes)
+	trimList(&cfg.Vless.PreferredDomains)
+	trimList(&cfg.Vless.Endpoints)
+	cfg.Vless.Nodes = UniqueStrings(cfg.Vless.Nodes)
+	cfg.Vless.PreferredDomains = UniqueStrings(cfg.Vless.PreferredDomains)
+	cfg.Vless.Endpoints = UniqueStrings(cfg.Vless.Endpoints)
 	if cfg.Vless.XrayVersion != "" && !strings.HasPrefix(cfg.Vless.XrayVersion, "v") {
 		cfg.Vless.XrayVersion = "v" + cfg.Vless.XrayVersion
 	}
 	if !cfg.Vless.Enabled {
 		return nil
 	}
-	if cfg.Vless.Subscription == "" {
-		return errors.New("vless.subscription must not be empty when vless is enabled")
+	// A pool needs candidates from somewhere: either a subscription or at least
+	// one fixed node. Accepting both lets a fixed node act as a stable fallback
+	// when the subscription is unreachable.
+	if cfg.Vless.Subscription == "" && len(cfg.Vless.Nodes) == 0 {
+		return errors.New("vless requires either a subscription or at least one fixed node")
 	}
-	u, err := url.Parse(cfg.Vless.Subscription)
-	if err != nil || u.Host == "" || (strings.ToLower(u.Scheme) != "http" && strings.ToLower(u.Scheme) != "https") {
-		return errors.New("vless.subscription must be an http or https URL")
+	for _, node := range cfg.Vless.Nodes {
+		if !strings.HasPrefix(strings.ToLower(node), "vless://") {
+			return fmt.Errorf("vless.nodes entry %q must be a vless:// share link", node)
+		}
+	}
+	if cfg.Vless.Subscription != "" {
+		u, err := url.Parse(cfg.Vless.Subscription)
+		if err != nil || u.Host == "" || (strings.ToLower(u.Scheme) != "http" && strings.ToLower(u.Scheme) != "https") {
+			return errors.New("vless.subscription must be an http or https URL")
+		}
 	}
 	if cfg.Vless.SubscriptionProxy != "" {
 		proxyURL, err := url.Parse(cfg.Vless.SubscriptionProxy)

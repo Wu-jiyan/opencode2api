@@ -56,54 +56,27 @@ Windows 下使用 `Copy-Item config.example.json config.json` 复制配置，编
 
 配置所在目录需要可写，用于密码迁移、配置保存和模型缓存。
 
-## Docker 部署
+## 下载二进制部署
 
-已发布镜像：`ghcr.io/wu-jiyan/opencode2api`。
-
-```bash
-cp config.example.json config.json
-# 启动前填写 Key，并替换 WebUI 密码。
-docker compose up -d
-docker compose logs -f
-```
-
-Compose **仅在首次启动时**把宿主机配置导入 `opencode2api-state` 命名卷，之后请通过 WebUI 修改配置。需要重新导入宿主机文件时：
+从 [Releases](https://github.com/Wu-jiyan/opencode2api/releases) 下载对应平台的压缩包。Linux 与 macOS 用 `.tar.gz`，Windows 用 `.zip`，每个包都附带 `.sha256` 校验文件，务必先校验再使用：
 
 ```bash
-docker compose cp config.json opencode2api:/var/lib/opencode2api/config.json
-docker compose restart
+VERSION=v1.0.0
+ARCH=linux_amd64        # 可选：linux_arm64、darwin_arm64、darwin_amd64
+curl -LO "https://github.com/Wu-jiyan/opencode2api/releases/download/${VERSION}/opencode2api_${VERSION}_${ARCH}.tar.gz"
+curl -LO "https://github.com/Wu-jiyan/opencode2api/releases/download/${VERSION}/opencode2api_${VERSION}_${ARCH}.tar.gz.sha256"
+sha256sum -c "opencode2api_${VERSION}_${ARCH}.tar.gz.sha256"
+tar -xzf "opencode2api_${VERSION}_${ARCH}.tar.gz"
+cd "opencode2api_${VERSION}_${ARCH}"
+vi config.json
+./opencode2api -config config.json
 ```
 
-容器内的服务进程以普通用户运行；Compose 启用只读根文件系统，并提供可写状态卷与临时 `/tmp` 文件系统。
+macOS 用 `shasum -a 256 -c` 替代 `sha256sum -c`；Windows 下载 `.zip` 后用 `Get-FileHash -Algorithm SHA256` 比对，再用 `Expand-Archive` 解压。
 
-| Compose 环境变量            | 默认值   | 作用                               |
-| --------------------------- | -------- | ---------------------------------- |
-| `OPENCODE2API_VERSION`      | `latest` | 镜像标签；可指定发行标签固定版本。 |
-| `OPENCODE2API_PORT`         | `8080`   | 映射到容器 8080 的宿主机端口。     |
-| `OPENCODE2API_WEBUI_PORT`   | `8081`   | 映射到容器 8081 的宿主机端口。     |
-| `OPENCODE2API_LISTEN`       | 未设置   | 显式覆盖容器内 API 监听地址。      |
-| `OPENCODE2API_WEBUI_LISTEN` | 未设置   | 显式覆盖容器内 WebUI 监听地址。    |
+压缩包内含对应平台的二进制、已填好占位符的 `config.json` 和三份文档，**不含启动脚本**（批处理文件在不同代码页下容易乱码），请直接运行二进制。启用 vless 但本地没有 Xray 时，服务会在后台自动下载。
 
-后两项在容器内对应 `LISTEN_ADDRESS` 与 `WEBUI_LISTEN_ADDRESS`，留空表示使用配置文件中的地址。首次初始化配置时，入口脚本会把示例配置里的 `127.0.0.1:8080` 改写为 `0.0.0.0:8080`，否则发布端口无法访问。
-
-修改宿主机端口不会改变容器内监听地址。若修改容器内 API 端口，还需同步调整端口映射与镜像健康检查（默认检查 8080）。
-
-镜像不内置 Xray，但**自动下载在容器内开箱可用**：下载位置是 `/var/lib/opencode2api/bin/xray/`，正好位于可写的状态卷内，重启后保留，无需挂载任何东西。
-
-如需改用自带的 Xray，挂载并关闭自动下载：
-
-```yaml
-services:
-  opencode2api:
-    volumes:
-      - /宿主机路径/xray:/app/bin/xray/xray:ro
-```
-
-```json
-"vless": { "auto_download_xray": false }
-```
-
-在 Docker 中使用 `proxyfile` 时，代理文件同样需要挂载到容器内配置指定的位置。
+更完整的说明——包括 systemd 常驻、各平台命令、配置生效方式——见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
 ## API 使用
 
@@ -285,7 +258,10 @@ direct
 | 字段                            | 默认值      | 含义                                                                                  |
 | ------------------------------- | ----------- | ------------------------------------------------------------------------------------- |
 | `vless.enabled`                 | `false`     | 打开 vless 代理池。                                                                   |
-| `vless.subscription`            | 空          | 订阅地址，需为 http/https。                                                           |
+| `vless.subscription`            | 空          | 订阅地址，需为 http/https。与 `nodes` 至少填一项。                                    |
+| `vless.nodes`                   | 空          | 固定 `vless://` 分享链接列表，可留空。与订阅可同时使用，固定节点优先占位。            |
+| `vless.preferred_domains`       | 空          | 入口域名（Cloudflare 优选域名或自选 IP），见下节。                                    |
+| `vless.endpoints`               | 空          | 服务入口，按顺序轮流分配到各候选，见下节。                                            |
 | `vless.count`                   | `24`        | 同时保持的本地监听器数量。                                                            |
 | `vless.refresh_seconds`         | `300`       | 滚动重建的基础间隔。                                                                  |
 | `vless.rotate_batch`            | `3`         | 每轮重建的监听器数量；越小则池整体越"热"，越大则整池轮换越快。                        |
@@ -298,6 +274,27 @@ direct
 | `vless.startup_timeout_seconds` | `15`        | 单个 Xray 实例启动后等待其开始监听的超时。                                            |
 
 轮换策略：`refresh_seconds` 到达时按 `rotate_batch` 重建一批监听器，实现滚动更新 —— 任何时刻池中都不会整体中断。每个新节点会先在临时端口上验证可连接，通过后才替换旧进程，因此"单节点重建后出口 IP 变化"不会以一次失败的连接为代价。
+
+#### 固定节点、入口域名与服务入口
+
+除订阅外，还可以直接配置固定的 `vless://` 链接，适合 Cloudflare 前置的节点 —— 订阅地址失效时服务照常工作，也适合只想锁定某几条线路的场景。
+
+`preferred_domains` 会把固定节点的**入口地址**替换成列表里的每一个值，每条生成一个候选，UUID、SNI、Host、路径与传输方式全部保持不变。因此一条链接就能撑起多个独立出口。地址是字面 IP、且不在列表中的节点会原样使用，不会被改写。
+
+```json
+"vless": {
+  "enabled": true,
+  "subscription": "",
+  "nodes": ["vless://uuid@ct.example.com:443?security=tls&sni=edn2.example.com&type=ws&host=edn2.example.com&path=%2F"],
+  "preferred_domains": ["cf.example.com", "ct.example.com", "cu.example.com"],
+  "endpoints": ["edn2.example.com", "edn3.example.com", "edn4.example.com"],
+  "count": 7
+}
+```
+
+`endpoints` 是同一服务的多个入口，按候选序号**轮流分配**而非随机 —— 每个入口通常各有独立的请求额度，均摊能把额度同时用完，而不是让随机偏斜提前耗掉其中一个。只有 Host 与 SNI 会变，UUID 标识的是用户而非入口，因此不受影响；留空则沿用链接自带的 host。
+
+固定节点候选会按实测延迟排序，快的优先占用前面的槽位。排序在后台完成，不阻塞启动；连不上的候选排在最后而不是被丢弃，以免池子缩到小于配置的 `count`。
 
 ### Xray 自动下载
 
@@ -465,7 +462,7 @@ npm run format
 npm run format:check
 ```
 
-项目通过 `.editorconfig`、`.gitattributes`、Go 格式化与固定版本的 Prettier 统一格式。CI 覆盖 Linux / Windows 上 Go 1.24 与稳定版 Go 的 `go vet` 和构建，以及格式检查、管理端构建和容器入口脚本语法检查。发布压缩包包含中英文两份 README。
+项目通过 `.editorconfig`、`.gitattributes`、Go 格式化与固定版本的 Prettier 统一格式。CI 覆盖 Linux / Windows 上 Go 1.24 与稳定版 Go 的 `go vet` 和构建，以及格式检查、管理端构建和 shell 脚本语法检查。发布压缩包包含中英文两份 README。
 
 ## 常见问题
 
@@ -476,8 +473,8 @@ npm run format:check
 | 模型列表为空                  | 检查配置的 Tier、匿名资格与原生协议是否受支持。    |
 | 请求返回 502 / 504            | 查看上游尝试、凭据、代理以及请求总超时和单次超时。 |
 | HTTP 200 但生成失败           | 查看 SSE 错误事件与请求结果，不能只看 HTTP 状态。  |
-| Docker 中宿主机配置修改不生效 | 当前配置在状态卷中；重新导入，或通过 WebUI 修改。  |
-| 无法通过容器端口访问          | 检查监听地址、端口映射与状态卷中的实际配置。       |
+| 修改 `config.json` 后未生效   | 查看事件日志中的校验错误；旧配置会继续运行。       |
+| 局域网访问不到 WebUI          | `webui.listen` 需监听 `0.0.0.0` 而非 `127.0.0.1`。 |
 | 重启后监控消失                | 监控仅保存在内存，需要外部收集 stdout 日志。       |
 
 ## 致谢

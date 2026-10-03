@@ -54,6 +54,9 @@ const form = reactive({
   vless: {
     enabled: false,
     subscription: "",
+    nodes: [""],
+    preferredDomains: [],
+    endpoints: [],
     count: 24,
     refreshSeconds: 300,
     rotateBatch: 3,
@@ -123,6 +126,9 @@ function fill(value) {
   Object.assign(form.vless, {
     enabled: !!vless.enabled,
     subscription: vless.subscription || "",
+    nodes: vless.nodes?.length ? [...vless.nodes] : [""],
+    preferredDomains: vless.preferred_domains?.length ? [...vless.preferred_domains] : [],
+    endpoints: vless.endpoints?.length ? [...vless.endpoints] : [],
     count: vless.count ?? 24,
     refreshSeconds: vless.refresh_seconds ?? 300,
     rotateBatch: vless.rotate_batch ?? 3,
@@ -161,6 +167,11 @@ function parseJson(label, text) {
   }
 }
 
+// 多行输入框里留下的空行不算配置项，否则每次保存都会往里塞一个空字符串。
+function cleanList(items) {
+  return items.map((item) => item.trim()).filter(Boolean);
+}
+
 async function load() {
   loading.value = true;
   try {
@@ -187,6 +198,9 @@ async function save() {
       vless: {
         enabled: form.vless.enabled,
         subscription: form.vless.subscription,
+        nodes: cleanList(form.vless.nodes),
+        preferred_domains: cleanList(form.vless.preferredDomains),
+        endpoints: cleanList(form.vless.endpoints),
         count: form.vless.count,
         refresh_seconds: form.vless.refreshSeconds,
         rotate_batch: form.vless.rotateBatch,
@@ -379,9 +393,53 @@ onMounted(load);
           </n-form-item>
         </n-gi>
         <n-gi :span="2">
-          <n-form-item label="订阅地址（兼容 v2ray / Clash）">
+          <n-form-item label="订阅地址（兼容 v2ray / Clash，可留空）">
             <n-input v-model:value="form.vless.subscription" placeholder="https://…" />
           </n-form-item>
+        </n-gi>
+        <n-gi :span="3">
+          <n-form-item label="固定节点（每行一条 vless:// 链接，可留空）">
+            <n-dynamic-input
+              v-model:value="form.vless.nodes"
+              type="textarea"
+              placeholder="vless://uuid@host:443?security=tls&type=ws&host=…&path=/…"
+            />
+          </n-form-item>
+        </n-gi>
+        <n-gi :span="3">
+          <n-form-item label="入口域名（回车添加；替换固定节点的入口地址）">
+            <n-select
+              v-model:value="form.vless.preferredDomains"
+              multiple
+              filterable
+              tag
+              :consistent-menu-width="false"
+              placeholder="cf.example.com"
+            />
+          </n-form-item>
+        </n-gi>
+        <n-gi :span="3">
+          <n-form-item label="服务入口（轮流分配；留空则沿用链接里的 host）">
+            <n-select
+              v-model:value="form.vless.endpoints"
+              multiple
+              filterable
+              tag
+              :consistent-menu-width="false"
+              placeholder="edn2.example.com"
+            />
+          </n-form-item>
+        </n-gi>
+        <n-gi :span="3">
+          <n-alert type="info" :bordered="false" class="block-gap">
+            <template #default>
+              <span class="section-caption">
+                固定节点的地址命中入口域名时，会按域名各生成一条候选：UUID、SNI、Host、路径保持不变，
+                只换入口地址，因此一条链接即可撑起多个独立出口。服务入口则按顺序轮流分配到各候选，
+                把各自的请求额度均匀摊开。订阅与固定节点可同时使用，固定节点优先占位。
+              </span>
+            </template>
+          </n-alert>
         </n-gi>
         <n-gi>
           <n-form-item label="节点数量">

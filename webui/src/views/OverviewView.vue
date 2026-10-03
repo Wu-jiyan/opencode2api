@@ -52,6 +52,19 @@ const proxyColumns = [
           { type: row.kind === "vless" ? "info" : "default", size: "small", bordered: false },
           { default: () => kindLabels[row.kind] || row.kind },
         ),
+        // 固定节点与订阅候选的运维含义不同：前者是手动指定的稳定路由，
+        // 后者会被轮换替换。混在一起看不出哪条是刻意选的。
+        row.kind === "vless" && row.source
+          ? h(
+              NTag,
+              {
+                size: "small",
+                bordered: false,
+                type: row.source === "fixed" ? "success" : "warning",
+              },
+              { default: () => (row.source === "fixed" ? "固定" : "订阅") },
+            )
+          : null,
         h(
           "span",
           { class: "mono proxy-label" },
@@ -64,8 +77,9 @@ const proxyColumns = [
     key: "upstream",
     minWidth: 200,
     ellipsis: { tooltip: true },
-    render: (row) => [row.server, row.transport].filter(Boolean).join(" · ") || "—",
+    render: (row) => [row.server, row.host, row.transport].filter(Boolean).join(" · ") || "—",
   },
+
   {
     title: "健康",
     key: "healthy",

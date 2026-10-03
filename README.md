@@ -54,54 +54,27 @@ The example listens on `127.0.0.1:8080` for the API and `0.0.0.0:8081` for the W
 
 The configuration directory must be writable for password migration, configuration saves, and model caches.
 
-## Docker
+## Binary
 
-The published image is `ghcr.io/wu-jiyan/opencode2api`.
-
-```bash
-cp config.example.json config.json
-# Configure keys and replace the WebUI password before starting.
-docker compose up -d
-docker compose logs -f
-```
-
-Compose imports the host configuration into the `opencode2api-state` volume **only on first startup**; change it through the WebUI afterwards. To import an edited host configuration again:
+Download the archive for your platform from [Releases](https://github.com/Wu-jiyan/opencode2api/releases). Linux and macOS ship `.tar.gz`, Windows ships `.zip`, and every archive comes with a `.sha256` file — verify it before use:
 
 ```bash
-docker compose cp config.json opencode2api:/var/lib/opencode2api/config.json
-docker compose restart
+VERSION=v1.0.0
+ARCH=linux_amd64        # or: linux_arm64, darwin_arm64, darwin_amd64
+curl -LO "https://github.com/Wu-jiyan/opencode2api/releases/download/${VERSION}/opencode2api_${VERSION}_${ARCH}.tar.gz"
+curl -LO "https://github.com/Wu-jiyan/opencode2api/releases/download/${VERSION}/opencode2api_${VERSION}_${ARCH}.tar.gz.sha256"
+sha256sum -c "opencode2api_${VERSION}_${ARCH}.tar.gz.sha256"
+tar -xzf "opencode2api_${VERSION}_${ARCH}.tar.gz"
+cd "opencode2api_${VERSION}_${ARCH}"
+vi config.json
+./opencode2api -config config.json
 ```
 
-The service runs as an unprivileged user inside the container. Compose uses a read-only root filesystem, a writable state volume, and a temporary `/tmp` filesystem.
+On macOS use `shasum -a 256 -c` instead of `sha256sum -c`. On Windows, download the `.zip`, compare it with `Get-FileHash -Algorithm SHA256`, and extract it with `Expand-Archive`.
 
-| Compose variable            | Default  | Effect                                            |
-| --------------------------- | -------- | ------------------------------------------------- |
-| `OPENCODE2API_VERSION`      | `latest` | Image tag. Pin a release tag for a fixed version. |
-| `OPENCODE2API_PORT`         | `8080`   | Host port mapped to container port 8080.          |
-| `OPENCODE2API_WEBUI_PORT`   | `8081`   | Host port mapped to container port 8081.          |
-| `OPENCODE2API_LISTEN`       | Unset    | Explicit container API listen override.           |
-| `OPENCODE2API_WEBUI_LISTEN` | Unset    | Explicit container WebUI listen override.         |
+Each archive contains the binary for that platform, a `config.json` pre-filled with placeholders, and the three documentation files. **No launcher script is bundled** — a batch file would need a specific code page to stay readable — so run the binary directly. If vless is enabled and Xray is missing locally, the service downloads it in the background.
 
-The last two become `LISTEN_ADDRESS` and `WEBUI_LISTEN_ADDRESS` inside the container; an empty value defers to the configuration file. While seeding a configuration, the entrypoint rewrites the example API address `127.0.0.1:8080` to `0.0.0.0:8080`, since the loopback default is unreachable through published ports.
-
-Changing host ports does not change container listeners. If you change the internal API port, also update the port mapping and the image health check, which uses port 8080.
-
-The image does not bundle Xray, but **the automatic download works out of the box inside the container**: files land in `/var/lib/opencode2api/bin/xray/`, which is inside the writable state volume and survives restarts, so nothing needs to be mounted.
-
-To use your own Xray instead, mount it and turn the automatic download off:
-
-```yaml
-services:
-  opencode2api:
-    volumes:
-      - /host/path/to/xray:/app/bin/xray/xray:ro
-```
-
-```json
-"vless": { "auto_download_xray": false }
-```
-
-A `proxyfile` used in Docker must also be available inside the container at the configured path.
+See [DEPLOYMENT.md](DEPLOYMENT.md) for the full guide, including systemd units, per-platform commands, and how configuration changes take effect.
 
 ## API usage
 
@@ -283,7 +256,10 @@ Subscriptions are accepted in both **v2ray** (base64 or a plaintext `vless://` l
 | Field                           | Default     | Meaning                                                                                                               |
 | ------------------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------- |
 | `vless.enabled`                 | `false`     | Turn on the vless pool.                                                                                               |
-| `vless.subscription`            | Empty       | Subscription URL; must be http/https.                                                                                 |
+| `vless.subscription`            | Empty       | Subscription URL; must be http/https. Either this or `nodes` is required.                                                             |
+| `vless.nodes`                   | Empty       | Fixed `vless://` share links. May be combined with a subscription; fixed nodes take the first slots.                              |
+| `vless.preferred_domains`       | Empty       | Entry domains (Cloudflare preferred domains or hand-picked IPs), see below.                                                          |
+| `vless.endpoints`               | Empty       | Service origins, handed out round-robin, see below.                                                                                 |
 | `vless.count`                   | `24`        | Number of local listeners kept alive.                                                                                 |
 | `vless.refresh_seconds`         | `300`       | Base interval for rolling rebuilds.                                                                                   |
 | `vless.rotate_batch`            | `3`         | Listeners rebuilt per round; smaller keeps the pool warmer, larger rotates it faster.                                 |
@@ -296,6 +272,27 @@ Subscriptions are accepted in both **v2ray** (base64 or a plaintext `vless://` l
 | `vless.startup_timeout_seconds` | `15`        | How long to wait for one Xray instance to start listening.                                                            |
 
 Rotation strategy: when `refresh_seconds` elapses, a batch of `rotate_batch` listeners is rebuilt, so the pool is never interrupted as a whole. Each new node is verified on a temporary port before it replaces an old process, which means "an IP change after rebuilding one node" never costs a failed connection.
+
+#### Fixed nodes, entry domains, and service origins
+
+Besides a subscription you can configure fixed `vless://` links directly. That suits Cloudflare-fronted nodes: the pool keeps working when a subscription URL goes away, and it lets you pin exactly the routes you want.
+
+`preferred_domains` replaces a fixed node's **entry address** with every value in the list, producing one candidate each while keeping the UUID, SNI, host, path, and transport untouched. A single link can therefore fill several independent egress routes. A node whose address is a literal IP and appears in no list is used as-is and never rewritten.
+
+```json
+"vless": {
+  "enabled": true,
+  "subscription": "",
+  "nodes": ["vless://uuid@ct.example.com:443?security=tls&sni=edn2.example.com&type=ws&host=edn2.example.com&path=%2F"],
+  "preferred_domains": ["cf.example.com", "ct.example.com", "cu.example.com"],
+  "endpoints": ["edn2.example.com", "edn3.example.com", "edn4.example.com"],
+  "count": 7
+}
+```
+
+`endpoints` names several origins of the same service and hands them out **round-robin rather than at random**, because each usually carries its own request budget: an even spread spends the allowances together instead of letting random drift drain one early. Only the host and SNI change — the UUID identifies the user rather than the entry point, so it is unaffected. Leaving the list empty keeps every candidate on the host its link named.
+
+Fixed-node candidates are ordered by measured latency, so the fastest take the earlier slots. Ranking runs in the background and never blocks startup, and a candidate that cannot be dialed sorts last instead of being dropped, which keeps the pool from shrinking below the configured `count`.
 
 ### Automatic Xray download
 
@@ -474,8 +471,8 @@ npm run format:check
 | No models are exposed                | Check configured tiers, anonymous eligibility, and native protocol support.               |
 | Requests return 502/504              | Inspect upstream attempts, credentials, proxies, and total/per-attempt timeouts.          |
 | HTTP 200 but generation failed       | Inspect the SSE error event and request outcome, not only HTTP status.                    |
-| Host edits have no effect in Docker  | The active file is in the state volume; import it again or use the WebUI.                 |
-| Container ports are unreachable      | Check listener addresses, published ports, and the active volume configuration.           |
+| `config.json` edits seem ignored      | Check validation errors in the event log; the previous config keeps running.               |
+| WebUI unreachable over the LAN        | `webui.listen` must be `0.0.0.0` rather than `127.0.0.1`.                                 |
 | Monitoring disappeared after restart | Monitoring is stored only in memory; collect stdout logs externally.                      |
 
 ## Acknowledgements

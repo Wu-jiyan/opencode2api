@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -30,6 +31,10 @@ type Node struct {
 	SpiderX    string
 	// ClientFP is the uTLS fingerprint carried by the share link (fp=).
 	ClientFP string
+	// Fixed marks a node the operator configured by hand rather than one a
+	// subscription returned, so diagnostics can tell a stable route from a
+	// rotating candidate.
+	Fixed bool
 }
 
 // DisplayName is a stable label used for logs and instance names.
@@ -176,6 +181,104 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// ParseFixedNodes expands the operator's hand-written share links into pool
+// candidates.
+//
+// A Cloudflare-fronted node reaches the same origin through whichever edge
+// address the link names, and the edge is what decides the outbound IP. So a
+// node whose address is covered by preferredDomains is cloned once per domain,
+// keeping UUID, SNI, host, path and transport intact — only the address differs.
+// Every clone is a genuinely different outbound route, which is how a single
+// fixed link can fill several listeners.
+//
+// endpoints names alternative origins for the same service. They are handed out
+// round-robin rather than at random: each one carries its own request budget, so
+// an even spread keeps the pool from draining one endpoint's allowance early
+// while another sits unused. Only the host and SNI move — the UUID stays valid
+// because it identifies the user, not the entry point.
+//
+// Nodes whose address is a literal IP, or that match no preferred domain, are
+// taken as-is: a fixed link is a deliberate choice and must not be rewritten
+// into something the operator did not ask for.
+func ParseFixedNodes(links, preferredDomains, endpoints []string) ([]Node, error) {
+	domains := make([]string, 0, len(preferredDomains))
+	for _, domain := range preferredDomains {
+		if value := strings.TrimSpace(domain); value != "" {
+			domains = append(domains, value)
+		}
+	}
+	origins := make([]string, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		if value := strings.TrimSpace(endpoint); value != "" {
+			origins = append(origins, value)
+		}
+	}
+	var out []Node
+	for _, link := range links {
+		node, err := ParseURI(link)
+		if err != nil {
+			return nil, fmt.Errorf("vless.nodes: %w", err)
+		}
+		node.Fixed = true
+		matches := false
+		for _, domain := range domains {
+			if strings.EqualFold(node.Address, domain) {
+				matches = true
+				break
+			}
+		}
+		if !matches || len(domains) == 0 {
+			out = append(out, applyEndpoint(node, origins, len(out)))
+			continue
+		}
+		for _, domain := range domains {
+			clone := node
+			clone.Address = domain
+			out = append(out, applyEndpoint(clone, origins, len(out)))
+		}
+	}
+	return out, nil
+}
+
+// applyEndpoint points a candidate at one of the alternative origins, cycling
+// through them so consecutive candidates land on different ones. The original
+// host is used as the SNI fallback so a node keeps working if an endpoint is
+// later removed from the list.
+func applyEndpoint(node Node, endpoints []string, position int) Node {
+	if len(endpoints) == 0 {
+		return node
+	}
+	endpoint := endpoints[position%len(endpoints)]
+	node.Host = endpoint
+	if node.SNI != "" {
+		node.SNI = endpoint
+	}
+	return node
+}
+
+// applyPreferredOrder reorders fixed candidates to match a measured ranking.
+// Candidates missing from the order keep their relative position at the end, so
+// a ranking taken before a configuration change cannot drop a node.
+func applyPreferredOrder(nodes []Node, order []string) []Node {
+	if len(order) == 0 || len(nodes) < 2 {
+		return nodes
+	}
+	rank := make(map[string]int, len(order))
+	for i, address := range order {
+		rank[strings.ToLower(address)] = i
+	}
+	out := append([]Node(nil), nodes...)
+	sort.SliceStable(out, func(i, j int) bool {
+		left, leftOK := rank[strings.ToLower(out[i].Address)]
+		right, rightOK := rank[strings.ToLower(out[j].Address)]
+		if leftOK != rightOK {
+			return leftOK
+		}
+		return left < right
+	})
+	return out
 }
 
 type clashDocument struct {

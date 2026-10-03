@@ -282,6 +282,12 @@ type ProxyStatus struct {
 	Node      string `json:"node,omitempty"`
 	Server    string `json:"server,omitempty"`
 	Transport string `json:"transport,omitempty"`
+	// Host is the vless origin the listener currently talks to. It is only set
+	// for fixed nodes, where several origins share the request budget.
+	Host string `json:"host,omitempty"`
+	// Source distinguishes a hand-configured vless node from a subscription
+	// candidate; it is empty for proxies that are not vless listeners.
+	Source    string `json:"source,omitempty"`
 	Healthy   bool   `json:"healthy"`
 	Checking  bool   `json:"checking"`
 	ZenKeys   int    `json:"zen_keys"`
@@ -326,6 +332,8 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 			status.Node = node.Node
 			status.Server = node.Server
 			status.Transport = node.Transport
+			status.Source = node.Source
+			status.Host = node.Host
 		}
 		if index < len(zenBindings) {
 			status.ZenKeys = zenBindings[index]

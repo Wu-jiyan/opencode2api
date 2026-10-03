@@ -9,6 +9,9 @@
   "vless": {
     "enabled": false,
     "subscription": "https://example.com/subscription",
+    "nodes": [],
+    "preferred_domains": [],
+    "endpoints": [],
     "count": 24,
     "refresh_seconds": 300,
     "rotate_batch": 3,

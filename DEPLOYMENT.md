@@ -1,12 +1,10 @@
 # 部署教程
 
-本文覆盖四种部署方式，以及首次配置、验证、常见故障。所有命令均在实际环境中验证过。
+本文覆盖两种部署方式，以及首次配置、验证、常见故障。所有命令均在实际环境中验证过。
 
 - [环境要求](#环境要求)
-- [方式一：Docker Compose（推荐）](#方式一docker-compose推荐)
-- [方式二：Docker 直接运行](#方式二docker-直接运行)
-- [方式三：下载 Release 二进制](#方式三下载-release-二进制)
-- [方式四：从源码编译](#方式四从源码编译)
+- [方式一：下载 Release 二进制](#方式一下载-release-二进制)
+- [方式二：从源码编译](#方式二从源码编译)
 - [首次配置](#首次配置)
 - [验证部署是否成功](#验证部署是否成功)
 - [Xray 与 vless 代理池](#xray-与-vless-代理池)
@@ -24,96 +22,11 @@
 | 配置文件目录  | 必须可写（密码迁移、配置保存、模型缓存、Xray 下载） |
 | 内存          | 常驻约 30–60 MiB；每个 Xray 进程约 20–40 MiB        |
 
-网关自身是纯静态 Go 程序，除 Xray 外不依赖任何运行时。
+网关自身是纯静态Go 程序，除 Xray 外不依赖任何运行时。
 
-## 方式一：Docker Compose（推荐）
+## 方式一：下载 Release 二进制
 
-### 1. 准备配置
-
-```bash
-mkdir -p opencode2api && cd opencode2api
-curl -LO https://raw.githubusercontent.com/Wu-jiyan/opencode2api/main/config.example.json
-mv config.example.json config.json
-```
-
-编辑 `config.json`，至少改这三处：
-
-```json
-{
-  "server_keys": ["换成你自己的长随机字符串"],
-  "zen_keys": ["sk-你的-Zen-Key"],
-  "webui": {
-    "username": "admin",
-    "password": "至少10位的强密码"
-  }
-}
-```
-
-### 2. 启动
-
-```bash
-docker compose up -d
-docker compose logs -f
-```
-
-首次启动时，Compose 会把宿主机 `config.json` 导入 `opencode2api-state` 卷，并把其中的 `127.0.0.1:8080` 改写为 `0.0.0.0:8080`（否则发布端口无法访问）。日志中会出现这两行提示。
-
-### 3. 可选：改端口
-
-在 `config.json` 之外通过环境变量控制对外端口，无需改配置：
-
-```bash
-OPENCODE2API_PORT=9000 OPENCODE2API_WEBUI_PORT=9001 docker compose up -d
-```
-
-| 变量                        | 默认值   | 作用                             |
-| --------------------------- | -------- | -------------------------------- |
-| `OPENCODE2API_VERSION`      | `latest` | 镜像标签，可填 `v1.0.0` 固定版本 |
-| `OPENCODE2API_PORT`         | `8080`   | 宿主机 API 端口                  |
-| `OPENCODE2API_WEBUI_PORT`   | `8081`   | 宿主机 WebUI 端口                |
-| `OPENCODE2API_LISTEN`       | 空       | 覆盖容器内 API 监听地址          |
-| `OPENCODE2API_WEBUI_LISTEN` | 空       | 覆盖容器内 WebUI 监听地址        |
-
-后两项留空表示使用 `config.json` 中的地址。修改宿主机端口不会改变容器内监听；若修改容器内 API 端口，还需同步调整端口映射和镜像健康检查（默认检查 8080）。
-
-### 4. 重要：配置修改的生效方式
-
-容器内真正使用的是**状态卷里的配置**，宿主机 `config.json` 只在首次启动时导入一次。之后修改必须走以下任一方式：
-
-```bash
-# 方式 A：重新导入宿主机配置（推荐，改配置文件的场景）
-docker compose cp config.json opencode2api:/var/lib/opencode2api/config.json
-docker compose restart
-
-# 方式 B：通过 WebUI 修改（改 Key、代理、模型等日常操作）
-# 打开 http://<宿主机地址>:8081 → 配置中心
-```
-
-WebUI 修改会实时生效，不需要重启（`listen`、`webui.listen`、`webui.enabled` 除外，这三项需要重启进程）。
-
-## 方式二：Docker 直接运行
-
-不用 Compose 时的完整命令：
-
-```bash
-docker volume create opencode2api-state
-
-docker run -d --name opencode2api \
-  --restart unless-stopped \
-  --read-only \
-  --security-opt no-new-privileges:true \
-  --tmpfs /tmp \
-  -p 8080:8080 -p 8081:8081 \
-  -e CONFIG_PATH=/var/lib/opencode2api/config.json \
-  -e CONFIG_SEED_PATH=/run/config/opencode2api.json \
-  -v "$PWD/config.json:/run/config/opencode2api.json:ro" \
-  -v opencode2api-state:/var/lib/opencode2api \
-  ghcr.io/wu-jiyan/opencode2api:latest
-```
-
-## 方式三：下载 Release 二进制
-
-适合不想装 Docker 的服务器。从 [Releases](https://github.com/Wu-jiyan/opencode2api/releases) 下载对应平台的压缩包，每个包都附带 `.sha256` 校验文件。
+从 [Releases](https://github.com/Wu-jiyan/opencode2api/releases) 下载对应平台的压缩包，每个包都附带 `.sha256` 校验文件。
 
 ### 压缩包里有什么
 
@@ -148,6 +61,15 @@ opencode2api_v1.0.0_linux_amd64/
 | `webui.password` | `change-this-admin-password` | 至少 10 位的强密码                                                |
 
 改完直接启动即可。启用 vless 但本地没有 Xray 时也不用管，服务会在后台自动下载。
+
+### 配置修改的生效方式
+
+启动后有两种改配置的方式：
+
+- **直接编辑 `config.json`** —— 服务会检测文件变化，先校验新配置再切换；校验失败则保留原配置继续运行，并在事件日志中给出原因。所以写错字段不会导致服务中断。
+- **通过 WebUI 修改** —— 打开 `http://<服务器地址>:8081` → 配置中心，实时生效。
+
+WebUI 修改同样不需要重启，只有 `listen`、`webui.listen`、`webui.enabled` 三项例外，改这三项需要重启进程。
 
 ### Linux (amd64)
 
@@ -249,7 +171,7 @@ sudo journalctl -u opencode2api -f
 
 `WorkingDirectory` 必须是配置所在目录 —— 相对路径的 `proxyfile`、`xray_path` 都以它为基准。
 
-## 方式四：从源码编译
+## 方式二：从源码编译
 
 需要 **Go 1.24 或更高版本**。
 
@@ -431,11 +353,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 3. `ghproxy.net`（约 0.01 MiB/s，很慢）
 4. 官方 `github.com` 直连（国内常超时，兜底）
 
-下载过程可在事件日志中查看：
-
-```bash
-docker compose logs -f | grep -i xray
-```
+下载过程可在事件日志中查看（WebUI → 事件日志，筛选 `xray`），或直接看标准输出：
 
 看到 `xray installed` 表示成功；`automatic xray download failed` 表示所有镜像都失败，此时可手动下载后用 `xray_path` 指定：
 
@@ -445,22 +363,43 @@ curl -LO https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-6
 unzip Xray-linux-64.zip xray && chmod +x xray && rm Xray-linux-64.zip
 ```
 
-### Docker 中的 Xray
+### 节点来源：订阅或固定节点
 
-镜像不内置 Xray，但**自动下载在容器内开箱可用**：下载位置是 `/var/lib/opencode2api/bin/xray/`，正好位于可写的状态卷内，重启后保留。
+两者至少填一项，可以只填其一，也可以同时使用（固定节点优先占用前面的槽位）：
 
-如需挂载已有的 Xray：
-
-```yaml
-services:
-  opencode2api:
-    volumes:
-      - /宿主机路径/xray:/app/bin/xray/xray:ro
+```json
+"vless": {
+  "enabled": true,
+  "subscription": "https://你的订阅地址",
+  "nodes": [],
+  "preferred_domains": [],
+  "endpoints": []
+}
 ```
 
-或用 `vless.xray_path` 指向挂载位置。
+只配固定节点时服务不会发起任何订阅请求，订阅失效也不影响池子工作：
 
-> 容器内如果开启自动下载且同时挂载了 Xray，请把 `auto_download_xray` 设为 `false`，避免重复下载。
+```json
+"vless": {
+  "enabled": true,
+  "subscription": "",
+  "nodes": ["vless://uuid@ct.example.com:443?security=tls&sni=edn2.example.com&type=ws&host=edn2.example.com&path=%2F%3Fed%3D2560"],
+  "preferred_domains": ["cf.example.com", "ct.example.com", "cu.example.com"],
+  "endpoints": ["edn2.example.com", "edn3.example.com", "edn4.example.com"],
+  "count": 7,
+  "port_base": 24100
+}
+```
+
+| 字段                | 说明                                                          |
+| ------------------- | ------------------------------------------------------------- |
+| `nodes`             | 固定 `vless://` 链接，每行一条                                 |
+| `preferred_domains` | 入口域名，替换固定节点的入口地址，每个值生成一个候选          |
+| `endpoints`         | 服务入口，按候选序号轮流分配；只有 Host 与 SNI 会变，UUID 不变 |
+
+`preferred_domains` 与 `endpoints` 的区别：前者决定"从哪个边缘地址进场"（出口 IP由此变化），后者决定"落到哪个服务入口"（各入口通常各有请求额度）。地址是字面 IP 且不在 `preferred_domains` 中的节点会原样使用，不会被改写。
+
+端口按候选数规划即可 —— 用固定节点时 `count` 建议设成 `preferred_domains` 的长度，多出来的槽位没有候选可用。固定节点候选会按实测延迟排序，快的占用靠前槽位，连不上的排最后而不是被丢弃，以免池子缩到小于 `count`。
 
 ### 端口规划
 
@@ -498,14 +437,7 @@ vless 池会占用 `port_base` 到 `port_base + count - 1` 的一段连续端口
 
 ## 升级与回滚
 
-### Compose
-
-```bash
-OPENCODE2API_VERSION=v1.1.0 docker compose up -d
-docker compose logs -f
-```
-
-### 二进制 / systemd
+下载新版本的压缩包并替换二进制即可：
 
 ```bash
 cd /opt/opencode2api
@@ -616,24 +548,17 @@ opencode2api -config config.json
 
 按顺序检查：
 
-1. `vless.enabled` 是否为 `true`，`subscription` 是否有效
-2. 订阅是否能访问：日志搜 `subscription` 相关事件
-3. 订阅格式是否为 v2ray（base64 或 `vless://` 列表）或 Clash / mihomo（YAML）
+1. `vless.enabled` 是否为 `true`，`subscription` 或 `nodes` 至少有一项且有效
+2. 订阅是否能访问：日志搜 `vless_refresh_failed` 相关事件
+3. 订阅格式是否为 v2ray（base64 或 `vless://` 列表）或 Clash / mihomo（YAML）；固定节点必须是 `vless://` 链接
 4. `port_base` 段是否被占用
 5. Xray 是否就绪：日志搜 `xray installed` 或 `xray_download_failed`
+
+只配固定节点时不需要订阅，日志会出现 `vless pool refreshed ... fixed=N`；若 N 为 0 说明链接无法解析。
 
 ### 代理节点状态异常
 
 概览页点"测试延迟"会实测每个节点经代理访问 Cloudflare 的首字节耗时，且**不会改动健康状态**。失败的节点会在 15 分钟后自动复查。
-
-### Docker 中修改配置不生效
-
-容器用的是状态卷里的配置，宿主机 `config.json` 只在首次启动时导入。重新导入：
-
-```bash
-docker compose cp config.json opencode2api:/var/lib/opencode2api/config.json
-docker compose restart
-```
 
 ### 重启后监控数据消失
 
