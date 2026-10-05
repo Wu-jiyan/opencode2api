@@ -26,6 +26,12 @@ import (
 
 const maxRequestBody = 32 << 20
 
+// listenerDrainBudget bounds how long a listener rotation waits for the exit it
+// is about to replace to finish its in-flight requests. It is short enough that
+// a rotation cycle is never stalled by one long stream, and long enough for a
+// normal turn to complete.
+const listenerDrainBudget = 20 * time.Second
+
 const anonymousZenKey = "public"
 
 type Gateway struct {
@@ -56,6 +62,13 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 		return nil, err
 	}
 	cooldown := time.Duration(cfg.Performance.FailureCooldownSeconds) * time.Second
+	// A listener rotation stops an Xray process, which tears down every tunnel
+	// it serves. Letting the pool ask the transport whether that exit still has
+	// a request in flight keeps a rotation from cutting a live stream; a busy
+	// exit is left alone and picked up by the next rotation instead.
+	vlessPool.SetDrainPolicy(func(address string) bool {
+		return transports.Drain(address, listenerDrainBudget)
+	})
 	zenNodes, err := newNodePool(cfg.ZenKeys, transports, cooldown)
 	if err != nil {
 		vlessPool.Stop()

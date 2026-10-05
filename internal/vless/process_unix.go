@@ -5,6 +5,7 @@ package vless
 import (
 	"os/exec"
 	"syscall"
+	"time"
 )
 
 // configureProcess puts the Xray child in its own process group so the whole
@@ -14,12 +15,23 @@ func configureProcess(cmd *exec.Cmd) {
 }
 
 // terminate stops the child and every process in its group.
+//
+// The wait is bounded: a child that ignores the graceful signal would otherwise
+// block here forever, and this runs on the rotation path that is responsible for
+// refreshing every listener.
 func terminate(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
 	pid := cmd.Process.Pid
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
-	_ = cmd.Wait()
+	exited := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(exited) }()
+	select {
+	case <-exited:
+		return
+	case <-time.After(terminateGrace):
+	}
 	_ = syscall.Kill(-pid, syscall.SIGKILL)
+	<-exited
 }

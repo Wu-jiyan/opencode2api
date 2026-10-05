@@ -327,7 +327,7 @@ func (g *Gateway) WaitForProxyPool(ctx context.Context) {
 	}
 	deadline := time.Now().Add(proxyPoolReadyTimeout)
 	for time.Now().Before(deadline) {
-		if g.vlessPool.Ready() {
+		if g.vlessPool.Settled() && g.vlessPool.Ready() {
 			select {
 			case <-ctx.Done():
 			case <-time.After(proxyPoolSettleDelay):
@@ -340,6 +340,8 @@ func (g *Gateway) WaitForProxyPool(ctx context.Context) {
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
+	g.logger.Warn("proxy pool did not become ready in time; refreshing with whatever route is available",
+		"component", "proxy", "event", "proxy_pool_timeout", "timeout_seconds", int(proxyPoolReadyTimeout/time.Second))
 }
 
 func (g *Gateway) refreshProtocolCapabilities(ctx context.Context) (modelcatalog.Capabilities, error) {

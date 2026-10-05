@@ -35,7 +35,24 @@ const (
 	// rankConcurrency bounds how many throwaway Xray processes run at once, so
 	// ranking a wide preferred-domain list does not spike CPU on startup.
 	rankConcurrency = 4
-	rankReadLimit  = 32 << 10
+	rankReadLimit   = 32 << 10
+
+	// listenPollInterval is how often a starting listener's port is re-checked.
+	// It is deliberately tight: the check runs while the slot's port is dead, so
+	// a coarse interval directly adds refused dials for the caller waiting on
+	// this exit.
+	listenPollInterval = 20 * time.Millisecond
+
+	// terminateGrace is how long a stopping Xray process may take to exit on
+	// its own before it is killed outright. Without a bound a child that ignores
+	// the graceful signal would wedge the rotation loop, which is the only thing
+	// that refreshes the listeners.
+	terminateGrace = 3 * time.Second
+
+	// rankWait bounds how long the first listener assignment waits for the
+	// latency ranking. Waiting keeps the pool from serving every slot in
+	// configuration order only to rebuild all of them once the ranking lands.
+	rankWait = 10 * time.Second
 )
 
 // proxyClient builds an HTTP client that dials through a local SOCKS5 listener.
@@ -50,16 +67,14 @@ func proxyClient(rawURL string) (*http.Client, error) {
 }
 
 type slot struct {
-	index  int
-	port   int
-	mu     sync.Mutex
-	cmd    *exec.Cmd
-	node   Node
+	index int
+	port  int
+	mu    sync.Mutex
+	cmd   *exec.Cmd
+	node  Node
+	// active records whether a listener is currently serving this slot, so a
+	// slot whose node could not be reached is never advertised as available.
 	active bool
-	// claimed marks the slot as reserved by an in-flight rebuild before its
-	// Xray process is adopted, so the port cannot be handed out twice.
-	claimed bool
-	pid     int
 }
 
 func (s *slot) proxyURL(host string) string {
@@ -81,17 +96,116 @@ type Pool struct {
 	pathMu       sync.Mutex
 	resolvedPath string
 
-	mu       sync.Mutex
-	slots    []*slot
-	nodes    []Node
+	mu    sync.Mutex
+	slots []*slot
+	nodes []Node
 	// preferredOrder holds fixed-candidate addresses sorted fastest first by
 	// rankFixedNodes. candidates re-applies it, so a ranking that lands after a
 	// refresh still decides which node the next rebuild hands out.
 	preferredOrder []string
-	cursor         int
 	rotation       int
-	cancel         context.CancelFunc
-	running        atomic.Bool
+	// cancellation and rotation state
+	cancel context.CancelFunc
+	// running guards against a second Start.
+	running atomic.Bool
+	// drain, when set, is consulted before a listener is torn down. It reports
+	// whether the exit currently has no in-flight request left; a false result
+	// postpones the rebuild so a rotation never severs a live stream.
+	drain func(proxyURL string) bool
+	// settled reports whether the first candidate assignment has finished. The
+	// pool publishes its proxy URLs before any listener exists, so a caller that
+	// needs a working route must wait for this instead of racing the rebuild.
+	settled atomic.Bool
+	// ranked is closed once the initial latency ranking finished or was skipped.
+	// The first assignment waits on it so the slots are laid out fastest-first
+	// from the start, instead of serving every slot in configuration order and
+	// then rebuilding all of them when the ranking lands.
+	ranked     chan struct{}
+	rankedOnce sync.Once
+	// rankedOK reports that the fixed candidates were actually measured. A
+	// ranking skipped for want of an executable must be retried once one lands.
+	rankedOK atomic.Bool
+	// wake asks the run loop to redo the assignment without waiting for the next
+	// scheduled tick, which is only 20 refresh intervals away.
+	wake chan struct{}
+	// assignMu serializes slot assignment. The rotation loop and the initial
+	// latency ranking both assign, from different goroutines, and two concurrent
+	// rebuilds of one slot would fight over the same listener port.
+	assignMu sync.Mutex
+}
+
+// markRanked releases the first assignment wait.
+func (p *Pool) markRanked() {
+	p.rankedOnce.Do(func() { close(p.ranked) })
+}
+
+// kick wakes the run loop so a change that is not on its schedule — an Xray
+// executable finally landing, for example — takes effect immediately instead of
+// after the next rotation interval.
+func (p *Pool) kick() {
+	p.mu.Lock()
+	wake := p.wake
+	p.mu.Unlock()
+	if wake == nil {
+		return
+	}
+	select {
+	case wake <- struct{}{}:
+	default:
+	}
+}
+
+// awaitRanking blocks for a bounded time until the initial latency ranking is
+// done. Ranking measures every preferred domain through a throwaway listener, so
+// it can take a while; the bound keeps a slow ranking from delaying the pool's
+// first listeners, in which case the slots are simply laid out in configuration
+// order as before.
+func (p *Pool) awaitRanking(ctx context.Context) {
+	p.mu.Lock()
+	ranked := p.ranked
+	p.mu.Unlock()
+	if ranked == nil {
+		return
+	}
+	timer := time.NewTimer(rankWait)
+	defer timer.Stop()
+	select {
+	case <-ranked:
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+}
+
+// Settled reports whether the pool finished assigning its first set of
+// listeners. It is the gate a startup refresh has to pass: the proxy list is
+// published up front, so without it the very first catalog fetch can dial a
+// port whose Xray process is still starting and fail every attempt.
+func (p *Pool) Settled() bool {
+	return p == nil || !p.Enabled() || p.settled.Load()
+}
+
+// SetDrainPolicy installs the callback consulted before a listener is stopped.
+// The callback must be safe to call from the rotation goroutine.
+func (p *Pool) SetDrainPolicy(drain func(string) bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.drain = drain
+}
+
+// canRebind reports whether the slot's current exit may be torn down now.
+func (p *Pool) canRebind(target *slot) bool {
+	p.mu.Lock()
+	drain := p.drain
+	p.mu.Unlock()
+	if drain == nil {
+		return true
+	}
+	if drain(target.proxyURL(p.cfg.Host)) {
+		return true
+	}
+	p.logger.Info("vless listener still busy, postponing rotation", "component", "vless",
+		"event", "vless_rebuild_deferred", "index", target.index, "port", target.port)
+	return false
 }
 
 // New creates a pool. The local proxy list is published immediately so the
@@ -107,6 +221,8 @@ func New(cfg config.VlessConfig, configDir string, logger *slog.Logger) *Pool {
 		slots = append(slots, &slot{index: i, port: cfg.PortBase + i})
 	}
 	pool.slots = slots
+	pool.ranked = make(chan struct{})
+	pool.wake = make(chan struct{}, 1)
 	pool.publish(pool.localProxies())
 	pool.enabled.Store(true)
 	return pool
@@ -261,6 +377,9 @@ func (p *Pool) Start(ctx context.Context) {
 // rotating set, and measuring them would add a probe process per candidate on
 // every refresh for no ordering benefit.
 func (p *Pool) rankFixedNodes(ctx context.Context) {
+	// Every early return below still counts as "ranking done": the first
+	// assignment must not keep waiting on a ranking that will never run.
+	defer p.markRanked()
 	if len(p.cfg.Nodes) == 0 || len(p.cfg.PreferredDomains) < 2 {
 		return
 	}
@@ -301,6 +420,7 @@ func (p *Pool) rankFixedNodes(ctx context.Context) {
 	p.mu.Unlock()
 	p.logger.Info("vless fixed nodes ranked by latency", "component", "vless", "event", "vless_ranked",
 		"nodes", len(order), "fastest_ms", millisOf(latencies[0]), "slowest_ms", millisOf(latencies[len(latencies)-1]))
+	p.rankedOK.Store(true)
 	// The first refresh already handed out slots in configuration order, so the
 	// ranking only takes effect once those slots are pointed at the faster
 	// nodes. Unchanged slots are left running.
@@ -362,6 +482,16 @@ func (p *Pool) downloadXray(ctx context.Context) {
 		return
 	}
 	p.invalidatePathCache()
+	// Every earlier attempt to rebuild a listener failed because the executable
+	// was missing, and the next scheduled pass is a full refresh interval away
+	// (twenty of them for a candidate refresh). Redo the assignment now, and
+	// retry the ranking too: it was skipped for the same missing executable.
+	p.logger.Info("xray executable available, rebuilding listeners", "component", "vless",
+		"event", "xray_ready", "directory", dir)
+	p.kick()
+	if !p.rankedOK.Load() {
+		go p.rankFixedNodes(ctx)
+	}
 }
 
 // Stop terminates every Xray process and stops the refresh loop.
@@ -395,6 +525,9 @@ func (p *Pool) run(ctx context.Context) {
 	refreshTicker := time.NewTicker(interval * 20)
 	defer rotateTicker.Stop()
 	defer refreshTicker.Stop()
+	p.mu.Lock()
+	wake := p.wake
+	p.mu.Unlock()
 	for {
 		select {
 		case <-ctx.Done():
@@ -402,6 +535,11 @@ func (p *Pool) run(ctx context.Context) {
 		case <-rotateTicker.C:
 			p.rotate(ctx)
 		case <-refreshTicker.C:
+			p.refresh(ctx)
+		case <-wake:
+			// Something outside the schedule changed: an Xray executable landed,
+			// or a ranking finished after the pool was already laid out. Redo the
+			// assignment now instead of after the next rotation.
 			p.refresh(ctx)
 		}
 	}
@@ -445,6 +583,7 @@ func (p *Pool) candidates(ctx context.Context) ([]Node, []Node, error) {
 // refresh pulls the candidate set and rebuilds every stale slot. On failure the
 // existing listeners are left running.
 func (p *Pool) refresh(ctx context.Context) {
+	p.awaitRanking(ctx)
 	fixed, subscription, err := p.candidates(ctx)
 	if err != nil {
 		p.logger.Warn("vless candidate refresh failed", "component", "vless", "event", "vless_refresh_failed", "error", err)
@@ -464,12 +603,19 @@ func (p *Pool) refresh(ctx context.Context) {
 	p.nodes = nodes
 	p.mu.Unlock()
 	p.assign(ctx, nodes)
+	p.settled.Store(true)
 }
 
 // assign points slot i at nodes[i], rebuilding only the slots whose node actually
 // changed. Rebuilding an unchanged slot would restart a working Xray process for
 // nothing, which is why the comparison happens first.
 func (p *Pool) assign(ctx context.Context, nodes []Node) {
+	// The rotation loop and the initial latency ranking both assign, from
+	// different goroutines. Serializing here keeps two rebuilds of the same slot
+	// from racing for one listener port.
+	p.assignMu.Lock()
+	defer p.assignMu.Unlock()
+
 	target := min(p.cfg.Count, len(nodes))
 	p.mu.Lock()
 	slots := append([]*slot(nil), p.slots...)
@@ -499,6 +645,12 @@ func (p *Pool) assign(ctx context.Context, nodes []Node) {
 // rotate rebuilds one batch of listeners so their outbound IP changes without
 // tearing down the whole pool at once.
 func (p *Pool) rotate(ctx context.Context) {
+	// Rotation rebuilds slots directly, so it takes the same lock as assign:
+	// both end up in rebuild, and two of them on one slot would fight over the
+	// same listener port.
+	p.assignMu.Lock()
+	defer p.assignMu.Unlock()
+
 	p.mu.Lock()
 	nodes := append([]Node(nil), p.nodes...)
 	slots := append([]*slot(nil), p.slots...)
@@ -533,40 +685,46 @@ func (p *Pool) rebuild(ctx context.Context, position int, node Node) {
 		return
 	}
 	target := p.slots[position]
-	target.claimed = true
 	socket := target.port
 	p.mu.Unlock()
-	defer func() {
-		p.mu.Lock()
-		target.claimed = false
-		p.mu.Unlock()
-	}()
 
 	executable := p.xrayPath()
 	if executable == "" {
 		p.logger.Warn("vless xray executable not found", "component", "vless", "event", "vless_xray_missing", "configured", p.cfg.XrayPath)
 		return
 	}
-	// Validate the node on a temporary port first. The slot keeps serving its
-	// previous exit until the new one is proven reachable.
-	probePort, err := freePort(p.cfg.Host)
-	if err != nil {
-		p.logger.Warn("vless no spare port for rebuild", "component", "vless", "event", "vless_port_unavailable", "error", err)
-		return
-	}
-	if !p.validate(ctx, executable, node, probePort) {
-		return
+	// A rotation re-points a slot at the node it already serves, and that node
+	// was proven when the slot was assigned. Re-validating it would spawn a
+	// second throwaway Xray for nothing, and that CPU spike slows the TLS
+	// handshakes of the requests actually in flight.
+	if !target.serves(node) {
+		// Validate the node on a temporary port first. The slot keeps serving its
+		// previous exit until the new one is proven reachable.
+		probePort, err := freePort(p.cfg.Host)
+		if err != nil {
+			p.logger.Warn("vless no spare port for rebuild", "component", "vless", "event", "vless_port_unavailable", "error", err)
+			return
+		}
+		if !p.validate(ctx, executable, node, probePort) {
+			return
+		}
 	}
 
-	// The node is reachable: stop whatever the slot runs now, then bind it to
-	// its own stable port so the published proxy list never moves.
-	target.stop()
+	// The slot's port is dead from stop() until the replacement accepts
+	// connections, and every refused dial in that window sends the caller
+	// failover to another exit — one more tunnel and TLS handshake per retry.
+	// Everything that can be done ahead of the stop is: wait for the current
+	// stream to finish, then render the config while the old exit still serves.
+	if target.running() && !p.canRebind(target) {
+		return
+	}
 	configPath, cleanup, err := p.writeConfig(target.index, node, socket)
 	if err != nil {
 		p.logger.Warn("vless instance config write failed", "component", "vless", "event", "vless_config_failed", "error", err)
 		return
 	}
 	defer cleanup()
+	target.stop()
 	cmd, err := p.launch(executable, configPath)
 	if err != nil {
 		p.logger.Warn("vless xray start failed", "component", "vless", "event", "vless_start_failed", "node", node.DisplayName(), "error", err)
@@ -724,7 +882,10 @@ func (p *Pool) waitListening(ctx context.Context, cmd *exec.Cmd, host string, po
 		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
 			return false
 		}
-		time.Sleep(120 * time.Millisecond)
+		// The poll runs while the slot's port is already dead, so every
+		// millisecond of it is a refused dial for whoever is waiting on this
+		// listener. Poll tightly instead of sleeping in fixed coarse steps.
+		time.Sleep(listenPollInterval)
 	}
 	terminate(cmd)
 	return false
@@ -816,19 +977,6 @@ func (s *slot) adopt(cmd *exec.Cmd, node Node, port int) {
 	s.node = node
 	s.port = port
 	s.active = cmd != nil
-	s.claimed = false
-	if cmd != nil && cmd.Process != nil {
-		s.pid = cmd.Process.Pid
-	}
-}
-
-func (s *slot) orphan() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.cmd = nil
-	s.active = false
-	s.claimed = false
-	s.pid = 0
 }
 
 func (s *slot) stop() {
@@ -836,8 +984,6 @@ func (s *slot) stop() {
 	cmd := s.cmd
 	s.cmd = nil
 	s.active = false
-	s.claimed = false
-	s.pid = 0
 	s.mu.Unlock()
 	if cmd != nil {
 		terminate(cmd)

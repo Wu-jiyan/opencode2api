@@ -158,7 +158,11 @@ type PerformanceConfig struct {
 	IdleConnTimeoutSeconds int `json:"idle_conn_timeout_seconds"`
 	ConnectTimeoutSeconds  int `json:"connect_timeout_seconds"`
 	FailureCooldownSeconds int `json:"failure_cooldown_seconds"`
-	AttemptTimeoutSeconds  int `json:"attempt_timeout_seconds"`
+	// AttemptTimeoutSeconds bounds how long a single attempt waits for the
+	// upstream response headers. Zero selects a bounded default instead of the
+	// whole request budget, so one silent exit cannot stall a request until the
+	// client gives up.
+	AttemptTimeoutSeconds int `json:"attempt_timeout_seconds"`
 	// ConnectionRotationSeconds recycles idle upstream connections so the next
 	// request dials again. A vless entry assigns a fresh exit IP to every new
 	// connection, so recycling is how the outbound IP is rotated; keep-alive
@@ -166,26 +170,33 @@ type PerformanceConfig struct {
 	ConnectionRotationSeconds int `json:"connection_rotation_seconds"`
 }
 
+// defaultAttemptTimeout bounds the wait for upstream response headers when
+// performance.attempt_timeout_seconds is not set. It is deliberately short: only
+// the header wait is bounded, so a slow but healthy model still streams for as
+// long as it needs, while an exit that accepts a connection and then goes quiet
+// is abandoned quickly enough for the next candidate to answer.
+const defaultAttemptTimeout = 45 * time.Second
+
 // AttemptTimeout bounds how long a single upstream attempt may wait for
 // response headers before it is abandoned and the next node is tried. Values
-// <= 0 keep the historical behavior of using the request-level retry timeout,
-// so existing configs are unaffected. The result never exceeds requestTimeout,
-// and only the header wait is bounded: an established stream keeps flowing
-// under the request-level timeout.
+// <= 0 keep a bounded default instead of the whole request budget: an exit
+// that accepts the connection and then goes silent would otherwise consume
+// every second of the request on its own, and the attempts after it would be
+// fired against an already-expired context. The result never exceeds
+// requestTimeout, and only the header wait is bounded: an established stream
+// keeps flowing under the request-level timeout.
 //
 // The bound is installed on the shared transports, so it covers every attempt
-// in both the anonymous and the authenticated loops. Without it, one hung exit
-// can consume the entire request budget by itself, and the attempts that follow
-// are fired against an already-expired context.
+// in both the anonymous and the authenticated loops.
 func (cfg PerformanceConfig) AttemptTimeout(requestTimeout time.Duration) time.Duration {
-	if cfg.AttemptTimeoutSeconds > 0 {
-		attempt := time.Duration(cfg.AttemptTimeoutSeconds) * time.Second
-		if requestTimeout > 0 && attempt > requestTimeout {
-			return requestTimeout
-		}
-		return attempt
+	attempt := time.Duration(cfg.AttemptTimeoutSeconds) * time.Second
+	if attempt <= 0 {
+		attempt = defaultAttemptTimeout
 	}
-	return requestTimeout
+	if requestTimeout > 0 && attempt > requestTimeout {
+		return requestTimeout
+	}
+	return attempt
 }
 
 func Load(path string) (Config, error) {
@@ -263,7 +274,7 @@ func Normalize(path string, cfg Config) (Config, error) {
 		return Config{}, errors.New("performance values must be positive (max_conns_per_host may be zero for unlimited)")
 	}
 	if cfg.Performance.AttemptTimeoutSeconds < 0 {
-		return Config{}, errors.New("performance.attempt_timeout_seconds must not be negative (0 keeps the retry timeout)")
+		return Config{}, errors.New("performance.attempt_timeout_seconds must not be negative (0 selects a bounded default)")
 	}
 	if cfg.Performance.ConnectionRotationSeconds < 0 {
 		return Config{}, errors.New("performance.connection_rotation_seconds must not be negative (0 disables rotation)")
