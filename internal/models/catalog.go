@@ -91,8 +91,11 @@ func NewCatalog(prefer config.Tier, overrides map[string]string) *Catalog {
 		nativeProtocols: map[config.Tier]map[string]wire.Protocol{config.TierZen: {}, config.TierGo: {}},
 		unsupported:     map[config.Tier]map[string]bool{config.TierZen: {}, config.TierGo: {}},
 		docs:            map[config.Tier]map[string]wire.Protocol{config.TierZen: {}, config.TierGo: {}},
-		prefer:          prefer,
-		cacheSource:     "none",
+		// modelMeta is written to by a refresh, so it must exist before the
+		// first one lands; a nil inner map panics on assignment.
+		modelMeta:   map[config.Tier]map[string]Metadata{config.TierZen: {}, config.TierGo: {}},
+		prefer:      prefer,
+		cacheSource: "none",
 	}
 }
 

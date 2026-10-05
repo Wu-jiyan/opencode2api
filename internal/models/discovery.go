@@ -173,6 +173,10 @@ func FetchCapabilities(ctx context.Context, client *http.Client, endpoint string
 	} {
 		tier, url := doc.tier, doc.url
 		go func() {
+			// The wait below is joined on every path, failure included. Leaving
+			// it unreleased deadlocks this function, which in turn blocks the
+			// whole catalog refresh with no error surfaced.
+			defer docWG.Done()
 			protocols, err := FetchProtocolDocs(ctx, client, url)
 			if err != nil {
 				return

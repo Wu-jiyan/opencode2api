@@ -1,12 +1,42 @@
 package models
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"opencode2api/internal/config"
 	wire "opencode2api/internal/protocol"
 )
+
+// FetchCapabilities looks up the endpoint tables in parallel and joins them at
+// the end. That join has to be released on every path, failure included: a
+// waiter that is never released blocks this function forever, and with it the
+// entire catalog refresh, so the service reports an empty model list while
+// logging nothing at all.
+func TestFetchCapabilitiesReturnsWhenEndpointTablesAreUnreachable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"opencode":{"api":"https://example.com/api","models":{"tier-model":{"id":"tier-model"}}}}`))
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = FetchCapabilities(ctx, server.Client(), server.URL)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("FetchCapabilities never returned: the endpoint-table wait is not released")
+	}
+}
 
 func number(v float64) *float64 { return &v }
 
@@ -42,6 +72,25 @@ func TestRefreshKeepsSystemOneWhenEndpointTablesFail(t *testing.T) {
 	}
 	if got := catalog.nativeProtocols[config.TierZen]["jev-1.13-free"]; got != wire.SystemOne {
 		t.Fatalf("jev-1.13-free protocol = %q, want systemone", got)
+	}
+}
+
+// A capability refresh that carries metadata must land it without panicking.
+// The per-tier metadata maps are written to on the first refresh, so a catalog
+// that was only constructed — never loaded from a cache — must already own them.
+func TestReplaceWithCapabilitiesAppliesMetadata(t *testing.T) {
+	catalog := NewCatalog(config.TierGo, nil)
+	metadata := map[config.Tier]map[string]Metadata{
+		config.TierZen: {"muse-spark-1.3": {ContextWindow: 200000, Reasoning: true}},
+		config.TierGo:  {},
+	}
+	catalog.ReplaceWithCapabilities([]string{"muse-spark-1.3"}, nil,
+		map[config.Tier]map[string]wire.Protocol{config.TierZen: {"muse-spark-1.3": wire.Responses}, config.TierGo: {}},
+		map[config.Tier]map[string]bool{config.TierZen: {}, config.TierGo: {}},
+		metadata, nil)
+
+	if got := catalog.MetadataForTier("muse-spark-1.3", config.TierZen); got.ContextWindow != 200000 || !got.Reasoning {
+		t.Fatalf("metadata = %+v, want context_window 200000 with reasoning", got)
 	}
 }
 
