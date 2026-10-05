@@ -41,6 +41,24 @@ type bridgeStreamEvent struct {
 	Usage      *Usage
 }
 
+// UpstreamStreamError is an error the upstream reported inside a stream that had
+// already answered with a success status. It is deliberately distinct from an
+// unparseable response: the upstream explained what went wrong, so that
+// explanation can be relayed to the caller instead of being replaced by a
+// generic conversion error that hides both the cause and the fact that the
+// upstream, not the gateway, refused the request.
+type UpstreamStreamError struct {
+	Type    string
+	Message string
+}
+
+func (e *UpstreamStreamError) Error() string {
+	if e.Message == "" {
+		return "upstream stream error"
+	}
+	return e.Message
+}
+
 // TranscodeStream is the request-aware form used by the
 // gateway. A cancelled client must not receive a synthetic upstream error
 // after its connection has gone away.

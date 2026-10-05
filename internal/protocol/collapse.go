@@ -2,7 +2,6 @@ package protocol
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
 	"time"
 )
@@ -40,7 +39,14 @@ func CollapseStream(reader io.Reader, protocol Protocol, model string) ([]byte, 
 				terminated = true
 				return errStreamNormalTermination
 			case "error":
-				streamErr = fmt.Errorf("%s", firstNonEmpty(event.Error, "upstream stream failed"))
+				// The upstream answered with a success status and then reported
+				// the failure inside the stream, so keep its own message and
+				// type: collapsing must not turn a rejection that the upstream
+				// explained into an unexplained conversion failure.
+				streamErr = &UpstreamStreamError{
+					Type:    event.ErrorType,
+					Message: firstNonEmpty(event.Error, "upstream stream failed"),
+				}
 				return errStreamUpstreamFailure
 			default:
 				acc.apply(event)

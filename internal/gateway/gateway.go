@@ -275,6 +275,16 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			// non-streaming client asked for.
 			collapsed, err := wire.CollapseStream(bytes.NewReader(responseBody), upstreamRoute.Protocol, model)
 			if err != nil {
+				// An error the upstream reported inside the stream is not a
+				// conversion failure: it refused the request and said why, so
+				// relay that reason instead of a generic unsupported-response
+				// message that hides the actual cause.
+				var upstreamErr *wire.UpstreamStreamError
+				if errors.As(err, &upstreamErr) {
+					g.logger.Warn("upstream rejected the request inside the stream", "component", "upstream", "event", "upstream_stream_error", "request_id", ids.Request, "model", model, "tier", upstreamRoute.Tier, "anonymous", upstreamRoute.Anonymous, "upstream_type", upstreamErr.Type, "error", upstreamErr.Message)
+					wire.WriteError(w, external, http.StatusBadGateway, upstreamErr.Message, "upstream_error", ids.Request)
+					return
+				}
 				g.logger.Warn("anonymous stream collapse failed", "component", "conversion", "event", "anonymous_collapse_failed", "request_id", ids.Request, "model", model, "source_protocol", upstreamRoute.Protocol, "error", err)
 				wire.WriteError(w, external, http.StatusBadGateway, "unsupported upstream response", "upstream_error", ids.Request)
 				return
