@@ -710,20 +710,23 @@ func (p *Pool) rebuild(ctx context.Context, position int, node Node) {
 		}
 	}
 
-	// The slot's port is dead from stop() until the replacement accepts
-	// connections, and every refused dial in that window sends the caller
-	// failover to another exit — one more tunnel and TLS handshake per retry.
-	// Everything that can be done ahead of the stop is: wait for the current
-	// stream to finish, then render the config while the old exit still serves.
-	if target.running() && !p.canRebind(target) {
-		return
-	}
+	// Render the config while the old exit still serves, so the port is dead
+	// for as little time as possible: from stop() until the replacement accepts
+	// connections. Every refused dial in that window sends the caller failover
+	// to another exit — one more tunnel and TLS handshake per retry.
 	configPath, cleanup, err := p.writeConfig(target.index, node, socket)
 	if err != nil {
 		p.logger.Warn("vless instance config write failed", "component", "vless", "event", "vless_config_failed", "error", err)
 		return
 	}
 	defer cleanup()
+	// Draining goes last, immediately before the stop. Doing it any earlier
+	// opens a window in which a fresh request can start streaming on this
+	// listener and then be severed by the stop, which is exactly the mid-answer
+	// cut this is meant to prevent.
+	if target.running() && !p.canRebind(target) {
+		return
+	}
 	target.stop()
 	cmd, err := p.launch(executable, configPath)
 	if err != nil {
