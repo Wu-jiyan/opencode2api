@@ -256,10 +256,10 @@ Subscriptions are accepted in both **v2ray** (base64 or a plaintext `vless://` l
 | Field                           | Default     | Meaning                                                                                                               |
 | ------------------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------- |
 | `vless.enabled`                 | `false`     | Turn on the vless pool.                                                                                               |
-| `vless.subscription`            | Empty       | Subscription URL; must be http/https. Either this or `nodes` is required.                                                             |
-| `vless.nodes`                   | Empty       | Fixed `vless://` share links. May be combined with a subscription; fixed nodes take the first slots.                              |
-| `vless.preferred_domains`       | Empty       | Entry domains (Cloudflare preferred domains or hand-picked IPs), see below.                                                          |
-| `vless.endpoints`               | Empty       | Service origins, handed out round-robin, see below.                                                                                 |
+| `vless.subscription`            | Empty       | Subscription URL; must be http/https. Either this or `nodes` is required.                                             |
+| `vless.nodes`                   | Empty       | Fixed `vless://` share links. May be combined with a subscription; fixed nodes take the first slots.                  |
+| `vless.preferred_domains`       | Empty       | Entry domains (Cloudflare preferred domains or hand-picked IPs), see below.                                           |
+| `vless.endpoints`               | Empty       | Service origins, handed out round-robin, see below.                                                                   |
 | `vless.count`                   | `24`        | Number of local listeners kept alive.                                                                                 |
 | `vless.refresh_seconds`         | `300`       | Base interval for rolling rebuilds.                                                                                   |
 | `vless.rotate_batch`            | `3`         | Listeners rebuilt per round; smaller keeps the pool warmer, larger rotates it faster.                                 |
@@ -471,8 +471,8 @@ npm run format:check
 | No models are exposed                | Check configured tiers, anonymous eligibility, and native protocol support.               |
 | Requests return 502/504              | Inspect upstream attempts, credentials, proxies, and total/per-attempt timeouts.          |
 | HTTP 200 but generation failed       | Inspect the SSE error event and request outcome, not only HTTP status.                    |
-| `config.json` edits seem ignored      | Check validation errors in the event log; the previous config keeps running.               |
-| WebUI unreachable over the LAN        | `webui.listen` must be `0.0.0.0` rather than `127.0.0.1`.                                 |
+| `config.json` edits seem ignored     | Check validation errors in the event log; the previous config keeps running.              |
+| WebUI unreachable over the LAN       | `webui.listen` must be `0.0.0.0` rather than `127.0.0.1`.                                 |
 | Monitoring disappeared after restart | Monitoring is stored only in memory; collect stdout logs externally.                      |
 
 ## Acknowledgements
