@@ -25,6 +25,10 @@ const (
 	// proxyPoolSettleDelay lets a few more listeners come up before the first
 	// refresh walks the pool, so it has failover options immediately.
 	proxyPoolSettleDelay = 3 * time.Second
+	// refreshOverallBudget bounds one complete catalog refresh. The per-attempt
+	// timeout is charged per exit, so without this cap a pool of slow exits can
+	// hold the refresh lock for minutes.
+	refreshOverallBudget = 60 * time.Second
 )
 
 // syncProxyResult updates proxy health from real traffic. Only timeouts and
@@ -108,6 +112,15 @@ func (g *Gateway) StartProxyHealthChecks(ctx context.Context) {
 		}
 	}
 	go func() {
+		// Check once at startup, but only once the listeners are up: running
+		// before the pool serves would fail every probe and mark usable exits
+		// unavailable. Waiting a full interval instead would keep a boot-time
+		// failure recorded for that whole window.
+		g.WaitForProxyPool(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		check()
 		ticker := time.NewTicker(proxyHealthCheckInterval)
 		defer ticker.Stop()
 		for {
@@ -281,19 +294,45 @@ func (g *Gateway) StartModelRefresh(ctx context.Context) {
 // and an operator-triggered refresh are serialized, so the upstream is never
 // queried twice at once.
 func (g *Gateway) RefreshModels(ctx context.Context) {
-	g.refreshMu.Lock()
-	defer g.refreshMu.Unlock()
+	// A scheduled refresh can hold this lock for as long as its own retries take,
+	// so the wait has to respect the caller's deadline. An unconditional Lock
+	// would make a manual refresh hang until the scheduled one finished, no
+	// matter how short the manual request's own budget was.
+	acquired := make(chan struct{})
+	go func() {
+		g.refreshMu.Lock()
+		close(acquired)
+	}()
+	select {
+	case <-acquired:
+		defer g.refreshMu.Unlock()
+	case <-ctx.Done():
+		// The waiter still takes the lock once the holder releases it; hand it
+		// straight back so the abandoned call does not leave it held.
+		go func() {
+			<-acquired
+			g.refreshMu.Unlock()
+		}()
+		return
+	}
+
+	// Bound the whole refresh. The per-attempt budget is paid once per exit, so
+	// on its own it lets a pool of slow exits hold the refresh lock for minutes;
+	// a scheduled refresh then blocks a manual one by that much. The cap keeps
+	// the wait bounded while still allowing a couple of exits to be tried.
+	refreshCtx, cancel := context.WithTimeout(ctx, refreshOverallBudget)
+	defer cancel()
 
 	var zen, goModels []string
 	var capabilities modelcatalog.Capabilities
 	var capabilitiesErr error
 	var wg sync.WaitGroup
 	wg.Add(3)
-	go func() { defer wg.Done(); zen = g.refreshZen(ctx) }()
-	go func() { defer wg.Done(); goModels = g.refreshTier(ctx, g.cfg.Upstream.Go, g.goNodes) }()
+	go func() { defer wg.Done(); zen = g.refreshZen(refreshCtx) }()
+	go func() { defer wg.Done(); goModels = g.refreshTier(refreshCtx, g.cfg.Upstream.Go, g.goNodes) }()
 	go func() {
 		defer wg.Done()
-		capabilityCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		capabilityCtx, cancel := context.WithTimeout(refreshCtx, 30*time.Second)
 		defer cancel()
 		capabilities, capabilitiesErr = g.refreshProtocolCapabilities(capabilityCtx)
 	}()
@@ -349,18 +388,26 @@ func (g *Gateway) refreshProtocolCapabilities(ctx context.Context) (modelcatalog
 		return modelcatalog.FetchCapabilities(ctx, &http.Client{Timeout: 30 * time.Second}, modelcatalog.CapabilitiesURL)
 	}
 	var lastErr error
-	for _, proxy := range g.transports.snapshot() {
-		if proxy == nil || !proxy.healthy.Load() {
-			continue
+	tried := 0
+	// Healthy exits first, then the remaining ones. A proxy marked unavailable
+	// by an unrelated request may still serve this fetch, and skipping every
+	// unhealthy entry outright would leave the catalog empty until the next
+	// scheduled interval even though a route was usable.
+	for _, healthyPass := range []bool{true, false} {
+		for _, proxy := range g.transports.snapshot() {
+			if proxy == nil || proxy.healthy.Load() != healthyPass {
+				continue
+			}
+			tried++
+			capabilities, err := modelcatalog.FetchCapabilities(ctx, proxy.client, modelcatalog.CapabilitiesURL)
+			if err == nil {
+				return capabilities, nil
+			}
+			lastErr = err
 		}
-		capabilities, err := modelcatalog.FetchCapabilities(ctx, proxy.client, modelcatalog.CapabilitiesURL)
-		if err == nil {
-			return capabilities, nil
-		}
-		lastErr = err
 	}
-	if lastErr == nil {
-		lastErr = errors.New("no healthy proxy available for OpenCode capability catalog")
+	if tried == 0 {
+		lastErr = errors.New("no proxy available for OpenCode capability catalog")
 	}
 	return modelcatalog.Capabilities{}, lastErr
 }
@@ -381,7 +428,16 @@ func (g *Gateway) refreshAnonymousTier(ctx context.Context, base string) []strin
 	for attempt := 1; attempt <= limit; attempt++ {
 		node := cursor.Next()
 		if node == nil {
-			break
+			// Same last-resort rule as the request path: when every exit is
+			// marked unavailable, one real attempt is what can bring the pool
+			// back, and refusing to make it leaves the catalog empty until the
+			// next scheduled refresh.
+			if attempt == 1 {
+				node = cursor.NextUnvetted()
+			}
+			if node == nil {
+				break
+			}
 		}
 		refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		models, status, err := modelcatalog.FetchModels(refreshCtx, node.proxy.client, base, anonymousZenKey)

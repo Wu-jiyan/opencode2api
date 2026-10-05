@@ -237,7 +237,17 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		}
 		node := cursor.Next()
 		if node == nil {
-			break
+			// Every exit is marked unavailable (unhealthy or cooling). Trying
+			// none of them would fail this request without ever contacting an
+			// upstream, which also means no outcome is produced that could
+			// clear the very state blocking the attempt. Fall back to the
+			// unvetted list so real traffic can restore the pool.
+			if attempts == 0 {
+				node = cursor.NextUnvetted()
+			}
+			if node == nil {
+				break
+			}
 		}
 		attempts++
 		if meta := telemetry.MetaFromContext(ctx); meta != nil {

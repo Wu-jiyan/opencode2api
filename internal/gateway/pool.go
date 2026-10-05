@@ -143,6 +143,27 @@ func (c *anonymousCursor) Next() *anonymousNode {
 	return nil
 }
 
+// NextUnvetted returns the next proxy regardless of its health flag or cooldown.
+// It is the last resort when every exit is currently marked unavailable, and it
+// exists to break a self-locking state: if no exit may be tried, the request
+// fails without ever reaching an upstream, so no real outcome is produced and
+// nothing can clear the flags that caused the refusal. Recovery would then
+// depend solely on a scheduled health check.
+func (c *anonymousCursor) NextUnvetted() *anonymousNode {
+	if c.pool == nil || len(c.pool.nodes) == 0 {
+		return nil
+	}
+	// The primary pass walks offset to the end before this is called, so it has
+	// to be rewound or the fallback would find nothing left to yield.
+	c.offset = 0
+	for c.offset < len(c.pool.nodes) {
+		node := c.pool.nodes[(c.start+c.offset)%len(c.pool.nodes)]
+		c.offset++
+		return node
+	}
+	return nil
+}
+
 func (p *anonymousPool) MarkSuccess(node *anonymousNode) {
 	if node == nil {
 		return
@@ -351,18 +372,29 @@ func (p *transportPool) checkClaimedProxy(ctx context.Context, proxy *proxyTrans
 	return result
 }
 
-// isProxyFailure deliberately recognizes only failures that say the proxy
-// route is unavailable. HTTP responses and unrelated transport/protocol errors
-// must not evict a proxy.
+// isProxyFailure deliberately recognizes only failures that say the proxy route
+// is unavailable: a refused or unreachable connection, or a dial that timed out.
+//
+// A response-header timeout is excluded on purpose. It says the upstream was
+// slow to answer, which is a reason to fail this request over to another exit,
+// not to record the exit as down. Recording it would take a working exit out of
+// service, and once that has happened across the pool there is nothing left to
+// route through: the anonymous lane would then refuse to try anything and no
+// attempt could produce the outcome that clears the flags.
 func isProxyFailure(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, syscall.ECONNREFUSED) {
+	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH) {
 		return true
 	}
-	var timeout interface{ Timeout() bool }
-	return errors.As(err, &timeout) && timeout.Timeout()
+	// Only the connection phase can prove the exit unusable, so a timeout is
+	// honored only when it belongs to the dial rather than the response.
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		return opErr.Timeout()
+	}
+	return false
 }
 
 // upstreamNode keeps a key stable while allowing its proxy binding to change

@@ -396,7 +396,20 @@ func (g *Gateway) forwardSystemOne(w http.ResponseWriter, r *http.Request, body 
 		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
+		// The copy error must be surfaced. A stream that dies mid-answer is
+		// otherwise indistinguishable from a clean finish on the server, and
+		// the client only sees a truncated event stream with no terminal event.
+		if _, copyErr := io.Copy(w, resp.Body); copyErr != nil {
+			if meta != nil {
+				meta.Outcome = "stream_error"
+				if wire.ClientCanceled(r.Context(), copyErr) {
+					meta.Outcome = "client_canceled"
+				}
+			}
+			if !errors.Is(copyErr, context.Canceled) {
+				g.logger.Warn("systemone stream ended with an error", "component", "stream", "event", "stream_failed", "request_id", ids.Request, "tier", upstreamRoute.Tier, "error", copyErr)
+			}
+		}
 		return
 	}
 	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))

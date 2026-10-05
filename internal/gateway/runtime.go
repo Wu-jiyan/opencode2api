@@ -62,9 +62,17 @@ func NewRuntimeManager(root context.Context, configPath string, cfg config.Confi
 		if runtime == nil || runtime.gateway == nil || runtime.gateway.transports == nil {
 			return nil
 		}
-		clients := make([]*http.Client, 0, runtime.gateway.transports.len())
-		for _, proxy := range runtime.gateway.transports.snapshot() {
-			if proxy != nil && proxy.healthy.Load() {
+		items := runtime.gateway.transports.snapshot()
+		clients := make([]*http.Client, 0, len(items))
+		// Healthy exits first, then the remaining ones. Returning only the
+		// healthy subset would hand the store an empty list whenever every exit
+		// is briefly flagged, dropping it to the direct fallback, which cannot
+		// reach models.dev from every deployment.
+		for _, healthyPass := range []bool{true, false} {
+			for _, proxy := range items {
+				if proxy == nil || proxy.healthy.Load() != healthyPass {
+					continue
+				}
 				clients = append(clients, proxy.client)
 			}
 		}
