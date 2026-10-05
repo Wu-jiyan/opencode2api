@@ -119,8 +119,15 @@ const columns = [
     ellipsis: { tooltip: true },
     render: (row) => {
       const source = row.anonymous_eligibility?.source;
-      if (!source) return "—";
-      return sourceLabels[source] || source;
+      // 弃用与是否免费是两件事：零成本模型即使已弃用仍然可以走匿名通道，
+      // 所以这里单独标出来，避免被误读成"不可用"。
+      const deprecated = row.anonymous_eligibility?.deprecated;
+      const label = source ? sourceLabels[source] || source : "—";
+      if (!deprecated) return label;
+      return h("div", { class: "row-with-tag" }, [
+        label,
+        h(NTag, { type: "warning", size: "small", bordered: false }, { default: () => "已弃用" }),
+      ]);
     },
   },
   {

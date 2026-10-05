@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 
 	"opencode2api/internal/config"
 	"opencode2api/internal/httpx"
@@ -27,6 +28,12 @@ type Capabilities struct {
 	Protocols   map[config.Tier]map[string]wire.Protocol
 	Unsupported map[config.Tier]map[string]bool
 	Metadata    map[config.Tier]map[string]Metadata
+	// Docs holds the protocols declared by the published endpoint tables. They
+	// are kept apart from the machine catalog because they arrive from a
+	// different host: the System One models exist only there, so a failure of
+	// that one fetch must be retryable on its own instead of taking the whole
+	// capability refresh down with it.
+	Docs map[config.Tier]map[string]wire.Protocol
 }
 
 type capabilityProvider struct {
@@ -125,7 +132,11 @@ func FetchCapabilities(ctx context.Context, client *http.Client, endpoint string
 		Protocols:   map[config.Tier]map[string]wire.Protocol{config.TierZen: {}, config.TierGo: {}},
 		Unsupported: map[config.Tier]map[string]bool{config.TierZen: {}, config.TierGo: {}},
 		Metadata:    map[config.Tier]map[string]Metadata{config.TierZen: {}, config.TierGo: {}},
+		Docs:        map[config.Tier]map[string]wire.Protocol{config.TierZen: {}, config.TierGo: {}},
 	}
+	var docMu sync.Mutex
+	var docWG sync.WaitGroup
+	docWG.Add(2)
 	for providerID, provider := range providers {
 		tier, ok := capabilityTier(providerID, provider.API)
 		if !ok {
@@ -147,10 +158,12 @@ func FetchCapabilities(ctx context.Context, client *http.Client, endpoint string
 			result.Metadata[tier][modelID] = model.metadata()
 		}
 	}
-	// The machine catalog is the primary source. The upstream endpoint tables
-	// are a supplemental source for models whose provider inherits a default SDK
-	// but whose published endpoint is more specific (for example a Messages
-	// route). This remains data-driven: no model IDs are embedded here.
+	// The endpoint tables are a supplemental source for models whose provider
+	// inherits a default SDK but whose published endpoint is more specific (a
+	// System One route, for example). They live on a separate host, so they are
+	// fetched concurrently: a slow table must not eat the whole capability
+	// budget and take the machine catalog down with it. A failure here is
+	// recorded per tier and never discards the catalog above.
 	for _, doc := range []struct {
 		tier config.Tier
 		url  string
@@ -158,15 +171,18 @@ func FetchCapabilities(ctx context.Context, client *http.Client, endpoint string
 		{config.TierZen, ZenDocsURL},
 		{config.TierGo, GoDocsURL},
 	} {
-		protocols, err := FetchProtocolDocs(ctx, client, doc.url)
-		if err != nil {
-			continue
-		}
-		for modelID, protocol := range protocols {
-			result.Protocols[doc.tier][modelID] = protocol
-			delete(result.Unsupported[doc.tier], modelID)
-		}
+		tier, url := doc.tier, doc.url
+		go func() {
+			protocols, err := FetchProtocolDocs(ctx, client, url)
+			if err != nil {
+				return
+			}
+			docMu.Lock()
+			result.Docs[tier] = protocols
+			docMu.Unlock()
+		}()
 	}
+	docWG.Wait()
 	if len(result.Protocols[config.TierZen]) == 0 && len(result.Protocols[config.TierGo]) == 0 && len(result.Unsupported[config.TierZen]) == 0 && len(result.Unsupported[config.TierGo]) == 0 {
 		return Capabilities{}, errors.New("OpenCode capability endpoint returned no Zen or Go models")
 	}
@@ -221,6 +237,17 @@ func FetchProtocolDocs(ctx context.Context, client *http.Client, endpoint string
 		return nil, errors.New("OpenCode endpoint documentation returned no protocol rows")
 	}
 	return result, nil
+}
+
+// ApplyDocs promotes the endpoint-table protocols into the catalog's own view,
+// where they outrank the machine catalog's SDK guess.
+func (c *Capabilities) ApplyDocs() {
+	for _, tier := range []config.Tier{config.TierZen, config.TierGo} {
+		for modelID, protocol := range c.Docs[tier] {
+			c.Protocols[tier][modelID] = protocol
+			delete(c.Unsupported[tier], modelID)
+		}
+	}
 }
 
 func capabilityTier(providerID, api string) (config.Tier, bool) {

@@ -17,7 +17,7 @@ import (
 	wire "opencode2api/internal/protocol"
 )
 
-const modelCatalogCacheSchemaVersion = 3
+const modelCatalogCacheSchemaVersion = 4
 
 var modelCatalogCacheWriteMu sync.Mutex
 
@@ -29,6 +29,11 @@ type modelCatalogCache struct {
 	NativeProtocols map[config.Tier]map[string]wire.Protocol `json:"native_protocols"`
 	Unsupported     map[config.Tier]map[string]bool          `json:"unsupported"`
 	Metadata        map[config.Tier]map[string]Metadata      `json:"metadata,omitempty"`
+	// Docs are the protocols published in the upstream endpoint tables. They
+	// are stored apart from NativeProtocols because they are the only source
+	// for a System One route: without them a restart that cannot reach the
+	// tables would drop those models from the catalog.
+	Docs map[config.Tier]map[string]wire.Protocol `json:"docs,omitempty"`
 }
 
 // LoadCache installs a validated disk snapshot into a catalog. It deliberately
@@ -45,6 +50,13 @@ func (c *Catalog) LoadCache(path string) error {
 	c.nativeProtocols = cloneTierProtocols(cache.NativeProtocols)
 	c.unsupported = cloneTierBools(cache.Unsupported)
 	c.modelMeta = cloneModelMeta(cache.Metadata)
+	c.docs = cloneTierProtocols(cache.Docs)
+	for _, tier := range []config.Tier{config.TierZen, config.TierGo} {
+		for model, protocol := range c.docs[tier] {
+			c.nativeProtocols[tier][model] = protocol
+			delete(c.unsupported[tier], model)
+		}
+	}
 	c.updatedAt = cache.UpdatedAt.UTC()
 	c.cacheSource = "disk"
 	c.stale = true
@@ -69,6 +81,7 @@ func (c *Catalog) SaveCache() error {
 		NativeProtocols: cloneTierProtocols(c.nativeProtocols),
 		Unsupported:     cloneTierBools(c.unsupported),
 		Metadata:        cloneModelMeta(c.modelMeta),
+		Docs:            cloneTierProtocols(c.docs),
 	}
 	c.mu.RUnlock()
 	if path == "" {
@@ -121,6 +134,13 @@ func loadModelCatalogCache(path string) (modelCatalogCache, error) {
 	}
 	cache.NativeProtocols = cloneTierProtocols(cache.NativeProtocols)
 	cache.Unsupported = cloneTierBools(cache.Unsupported)
+	cache.Docs = cloneTierProtocols(cache.Docs)
+	for _, tier := range []config.Tier{config.TierZen, config.TierGo} {
+		for model, protocol := range cache.Docs[tier] {
+			cache.NativeProtocols[tier][model] = protocol
+			delete(cache.Unsupported[tier], model)
+		}
+	}
 	cache.UpdatedAt = cache.UpdatedAt.UTC()
 	return cache, nil
 }

@@ -158,6 +158,12 @@ body {
   font-size: 12px;
 }
 
+.row-with-tag {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 /* Proxy table */
 .proxy-name {
   display: flex;

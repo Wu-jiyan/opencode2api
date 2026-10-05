@@ -305,7 +305,8 @@ func (g *Gateway) RefreshModels(ctx context.Context) {
 		g.logger.Warn("OpenCode capability catalog refresh failed", "component", "models", "event", "capability_refresh_failed", "error", capabilitiesErr)
 	}
 	if zen != nil || goModels != nil {
-		g.catalog.ReplaceWithCapabilities(zen, goModels, capabilities.Protocols, capabilities.Unsupported, capabilities.Metadata)
+		capabilities.ApplyDocs()
+		g.catalog.ReplaceWithCapabilities(zen, goModels, capabilities.Protocols, capabilities.Unsupported, capabilities.Metadata, capabilities.Docs)
 		if ctx.Err() == nil {
 			if err := g.catalog.SaveCache(); err != nil {
 				g.logger.Warn("model catalog cache write failed", "component", "models", "event", "catalog_cache_write_failed", "error", err)

@@ -236,7 +236,12 @@ func (store *PricingStore) Decide(model string) AnonymousDecision {
 	decision := AnonymousDecision{
 		Known: true, Deprecated: price.Deprecated, InputCost: price.Input, OutputCost: price.Output,
 	}
-	metadataFree := !price.Deprecated && price.Input != nil && price.Output != nil && *price.Input == 0 && *price.Output == 0
+	// A zero price is what makes a model usable on the anonymous lane;
+	// deprecation only says the upstream may retire it, which is reported on its
+	// own field. Requiring a non-deprecated model here made every retired free
+	// model read as "paid", so mimo-v2.5-free was reported as name-only even
+	// though models.dev lists it at zero cost.
+	metadataFree := price.Input != nil && price.Output != nil && *price.Input == 0 && *price.Output == 0
 	if nameFree || metadataFree {
 		decision.Allowed = true
 		switch {

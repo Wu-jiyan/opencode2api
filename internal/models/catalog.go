@@ -57,13 +57,18 @@ type Catalog struct {
 	nativeProtocols map[config.Tier]map[string]wire.Protocol
 	unsupported     map[config.Tier]map[string]bool
 	modelMeta       map[config.Tier]map[string]Metadata
-	updatedAt       time.Time
-	prefer          config.Tier
-	pricing         *PricingStore
-	cachePath       string
-	cacheSource     string
-	stale           bool
-	refreshAfter    time.Duration
+	// docs keeps the protocols published in the upstream endpoint tables. They
+	// are retained separately from nativeProtocols so a refresh can fall back
+	// to them: the System One models are declared only there, and losing that
+	// one fetch must not make them unroutable.
+	docs         map[config.Tier]map[string]wire.Protocol
+	updatedAt    time.Time
+	prefer       config.Tier
+	pricing      *PricingStore
+	cachePath    string
+	cacheSource  string
+	stale        bool
+	refreshAfter time.Duration
 }
 
 type CatalogSnapshot struct {
@@ -84,8 +89,10 @@ func NewCatalog(prefer config.Tier, overrides map[string]string) *Catalog {
 	return &Catalog{
 		zen: map[string]bool{}, goModels: map[string]bool{}, protocols: protocols,
 		nativeProtocols: map[config.Tier]map[string]wire.Protocol{config.TierZen: {}, config.TierGo: {}},
-		unsupported:     map[config.Tier]map[string]bool{config.TierZen: {}, config.TierGo: {}}, prefer: prefer,
-		cacheSource: "none",
+		unsupported:     map[config.Tier]map[string]bool{config.TierZen: {}, config.TierGo: {}},
+		docs:            map[config.Tier]map[string]wire.Protocol{config.TierZen: {}, config.TierGo: {}},
+		prefer:          prefer,
+		cacheSource:     "none",
 	}
 }
 
@@ -120,10 +127,10 @@ func (c *Catalog) SetRefreshInterval(interval time.Duration) {
 }
 
 func (c *Catalog) Replace(zen, goModels []string) {
-	c.ReplaceWithCapabilities(zen, goModels, nil, nil, nil)
+	c.ReplaceWithCapabilities(zen, goModels, nil, nil, nil, nil)
 }
 
-func (c *Catalog) ReplaceWithCapabilities(zen, goModels []string, native map[config.Tier]map[string]wire.Protocol, unsupported map[config.Tier]map[string]bool, metadata map[config.Tier]map[string]Metadata) {
+func (c *Catalog) ReplaceWithCapabilities(zen, goModels []string, native map[config.Tier]map[string]wire.Protocol, unsupported map[config.Tier]map[string]bool, metadata map[config.Tier]map[string]Metadata, docs map[config.Tier]map[string]wire.Protocol) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if zen != nil {
@@ -132,22 +139,47 @@ func (c *Catalog) ReplaceWithCapabilities(zen, goModels []string, native map[con
 	if goModels != nil {
 		c.goModels = toSet(goModels)
 	}
-	if native != nil {
-		for _, tier := range []config.Tier{config.TierZen, config.TierGo} {
-			if protocols, ok := native[tier]; ok {
-				c.nativeProtocols[tier] = cloneProtocols(protocols)
+	// Capability data is merged, never replaced wholesale. A refresh reaches the
+	// machine catalog and the endpoint tables through independent upstreams, so
+	// any one of them can come back partial; dropping the entries a partial
+	// answer omitted would unpublish models that were routable a moment ago —
+	// the System One models exist only in the endpoint tables, for example.
+	for _, tier := range []config.Tier{config.TierZen, config.TierGo} {
+		if protocols, ok := native[tier]; ok {
+			for model, protocol := range protocols {
+				c.nativeProtocols[tier][model] = protocol
 			}
 		}
-	}
-	if unsupported != nil {
-		for _, tier := range []config.Tier{config.TierZen, config.TierGo} {
-			if models, ok := unsupported[tier]; ok {
-				c.unsupported[tier] = cloneBools(models)
+		if models, ok := unsupported[tier]; ok {
+			for model := range models {
+				c.unsupported[tier][model] = true
 			}
 		}
+		// A protocol declaration always beats an "unsupported" note: the
+		// machine catalog can lack an SDK mapping for a model the endpoint
+		// tables route explicitly.
+		for model, protocol := range native[tier] {
+			if protocol != "" {
+				delete(c.unsupported[tier], model)
+			}
+		}
+		if models, ok := metadata[tier]; ok {
+			for model, value := range models {
+				c.modelMeta[tier][model] = value
+			}
+		}
+		if protocols, ok := docs[tier]; ok && len(protocols) > 0 {
+			c.docs[tier] = cloneProtocols(protocols)
+		}
 	}
-	if metadata != nil {
-		c.modelMeta = cloneModelMeta(metadata)
+	// Re-apply the retained endpoint tables every time, so the models declared
+	// only there keep their published protocol even if this round's table fetch
+	// came back empty.
+	for _, tier := range []config.Tier{config.TierZen, config.TierGo} {
+		for model, protocol := range c.docs[tier] {
+			c.nativeProtocols[tier][model] = protocol
+			delete(c.unsupported[tier], model)
+		}
 	}
 	c.updatedAt = time.Now().UTC()
 	c.cacheSource = "live"
@@ -169,12 +201,16 @@ func (c *Catalog) CopyState(source *Catalog) {
 	}
 	native := map[config.Tier]map[string]wire.Protocol{config.TierZen: {}, config.TierGo: {}}
 	unsupported := map[config.Tier]map[string]bool{config.TierZen: {}, config.TierGo: {}}
+	docs := map[config.Tier]map[string]wire.Protocol{config.TierZen: {}, config.TierGo: {}}
 	for _, tier := range []config.Tier{config.TierZen, config.TierGo} {
 		for model, protocol := range source.nativeProtocols[tier] {
 			native[tier][model] = protocol
 		}
 		for model, value := range source.unsupported[tier] {
 			unsupported[tier][model] = value
+		}
+		for model, protocol := range source.docs[tier] {
+			docs[tier][model] = protocol
 		}
 	}
 	meta := cloneModelMeta(source.modelMeta)
@@ -184,6 +220,7 @@ func (c *Catalog) CopyState(source *Catalog) {
 	source.mu.RUnlock()
 	c.mu.Lock()
 	c.zen, c.goModels, c.nativeProtocols, c.unsupported, c.updatedAt = zen, goModels, native, unsupported, updatedAt
+	c.docs = docs
 	c.modelMeta = meta
 	c.cacheSource, c.stale = cacheSource, stale
 	c.mu.Unlock()
@@ -293,9 +330,19 @@ func (c *Catalog) Diagnostic(model string, requested wire.Protocol, hasZenKeys, 
 	c.mu.RLock()
 	configured, explicit := c.protocols[model]
 	zen, goModel := c.zen[model], c.goModels[model]
-	nativeProtocols := map[config.Tier]wire.Protocol{
-		config.TierZen: c.protocolForLocked(model, config.TierZen),
-		config.TierGo:  c.protocolForLocked(model, config.TierGo),
+	// Only real declarations go into this snapshot. protocolForLocked answers
+	// with a Chat default for an unknown ID, and mixing that default into the
+	// report is what made a Zen-only System One model read as "chat".
+	declared := map[config.Tier]wire.Protocol{}
+	if configured != "" {
+		declared[config.TierZen], declared[config.TierGo] = configured, configured
+	} else {
+		if protocol := c.nativeProtocols[config.TierZen][model]; protocol != "" {
+			declared[config.TierZen] = protocol
+		}
+		if protocol := c.nativeProtocols[config.TierGo][model]; protocol != "" {
+			declared[config.TierGo] = protocol
+		}
 	}
 	_, zenKnown := c.nativeProtocols[config.TierZen][model]
 	_, goKnown := c.nativeProtocols[config.TierGo][model]
@@ -309,15 +356,15 @@ func (c *Catalog) Diagnostic(model string, requested wire.Protocol, hasZenKeys, 
 	}
 	protocol := configured
 	if protocol == "" {
-		// Route() below selects the preferred available tier. This is only the
-		// fallback shown when no route can currently be built.
-		protocol = nativeProtocols[config.TierZen]
-		if c.prefer == config.TierGo {
-			protocol = nativeProtocols[config.TierGo]
-		}
+		// Route() below replaces this with the protocol of the tier that will
+		// actually serve the request. Only the no-route fallback is shown here,
+		// and it must come from a tier that declares the model: preferring the
+		// operator's tier blindly reported an unknown Go entry as the Chat
+		// default even for a Zen-only System One model.
+		protocol = knownProtocol(declared, c.prefer)
 	}
 	diagnostic := RouteDiagnostic{
-		Model: model, RequestedProtocol: requested, NativeProtocol: protocol, NativeProtocols: nativeProtocols, ProtocolSource: source,
+		Model: model, RequestedProtocol: requested, NativeProtocol: protocol, NativeProtocols: declared, ProtocolSource: source,
 		AvailableZen: zen, AvailableGo: goModel, AnonymousEligibility: c.anonymousDecision(model),
 	}
 	route, err := c.Route(model, hasZenKeys, hasGoKeys, hasAnonymous)
@@ -330,6 +377,21 @@ func (c *Catalog) Diagnostic(model string, requested wire.Protocol, hasZenKeys, 
 	diagnostic.Tier, diagnostic.Anonymous = route.Tier, route.Anonymous
 	diagnostic.KeyTiers = append([]config.Tier(nil), route.KeyTiers...)
 	return diagnostic
+}
+
+// knownProtocol returns the operator's preferred tier when that tier declares
+// the model, and otherwise the single tier that does. An empty result means no
+// tier has a declaration, which is reported as-is rather than defaulted.
+func knownProtocol(declared map[config.Tier]wire.Protocol, prefer config.Tier) wire.Protocol {
+	if protocol := declared[prefer]; protocol != "" {
+		return protocol
+	}
+	for _, tier := range []config.Tier{config.TierZen, config.TierGo} {
+		if protocol := declared[tier]; protocol != "" {
+			return protocol
+		}
+	}
+	return ""
 }
 
 func isFreeModel(model string) bool {
@@ -439,15 +501,13 @@ func (c *Catalog) tierSupportedLocked(model string, tier config.Tier) bool {
 	if c.protocols[model] != "" {
 		return true
 	}
+	// Only an explicit "unsupported" note from the machine catalog rules a model
+	// out. Absence of a note carries no information: a refresh whose endpoint
+	// tables came back empty must not read as "this model cannot be served".
 	if c.unsupported[tier][model] {
 		return false
 	}
-	if c.nativeProtocols[tier][model] != "" {
-		return true
-	}
-	// A pending catalog has no upstream capability snapshot to contradict a
-	// configured key, so retain the pre-refresh compatibility behavior.
-	return len(c.zen) == 0 && len(c.goModels) == 0
+	return true
 }
 
 func toSet(items []string) map[string]bool {
