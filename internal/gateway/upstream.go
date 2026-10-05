@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"opencode2api/internal/config"
@@ -253,7 +254,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		}
 		setRequestCredential(ctx, config.TierZen, "anonymous", "anonymous", true, node.proxy)
 		started := time.Now()
-		resp, err := node.proxy.client.Do(req)
+		resp, err := node.proxy.do(req)
 		duration := time.Since(started)
 		if ctx.Err() != nil {
 			// The parent budget expired while this attempt was in flight. Its
@@ -268,6 +269,15 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		g.observeAnonymousResult(ctx, node, resp, err)
 		if err == nil && resp.StatusCode/100 == 2 {
 			g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+			return resp, nil, attempts
+		}
+		// A request-shape rejection is deterministic: the next exit would reject
+		// it identically, so scanning the rest of the pool only buys one tunnel
+		// and TLS handshake per remaining proxy before the client is told the
+		// same thing. This mirrors the rule the authenticated lane already
+		// applies; auth, throttling and server failures still rotate.
+		if isNonRetryableClientResponse(resp, err) {
+			g.logger.Debug("anonymous upstream rejected a non-retryable request", "component", "upstream", "event", "anonymous_attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "status", resp.StatusCode, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds())
 			return resp, nil, attempts
 		}
 		lastResponse = resp
@@ -565,7 +575,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 		keyID := config.KeyDisplayID(node.key)
 		setRequestCredential(ctx, route.Tier, keyID, "key", false, proxy)
 		attemptStarted := time.Now()
-		resp, err := proxy.client.Do(req)
+		resp, err := proxy.do(req)
 		attemptDuration := time.Since(attemptStarted)
 		if ctx.Err() != nil {
 			// The request budget expired while this attempt was in flight. A
@@ -633,6 +643,36 @@ func upstreamStatus(resp *http.Response) int {
 		return 0
 	}
 	return resp.StatusCode
+}
+
+// releaseOnClose ties an in-flight slot to the lifetime of the response body,
+// so a transport stays marked busy for as long as a stream is still being read
+// and goes idle exactly once the body is closed.
+type releaseOnClose struct {
+	io.ReadCloser
+	release func()
+	once    sync.Once
+}
+
+func (r *releaseOnClose) Close() error {
+	err := r.ReadCloser.Close()
+	r.once.Do(r.release)
+	return err
+}
+
+// do performs the request and keeps the transport marked busy until the
+// response body is closed, so a rotation that stops this listener's process
+// waits for the stream instead of cutting it. A failed dial never opened a
+// stream and releases immediately.
+func (t *proxyTransport) do(req *http.Request) (*http.Response, error) {
+	t.active.Add(1)
+	resp, err := t.client.Do(req)
+	if err != nil || resp == nil {
+		t.active.Add(-1)
+		return resp, err
+	}
+	resp.Body = &releaseOnClose{ReadCloser: resp.Body, release: func() { t.active.Add(-1) }}
+	return resp, nil
 }
 
 func setRequestCredential(ctx context.Context, tier config.Tier, keyID, channel string, anonymous bool, proxy *proxyTransport) {

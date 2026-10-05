@@ -25,11 +25,37 @@ type proxyTransport struct {
 	// muIndex is the live position of this transport in the pool. It is
 	// reloaded on every binding decision because a rebuild can renumber the
 	// entries while keys still hold a reference to this struct.
-	muIndex  atomic.Int64
-	name     string
-	client   *http.Client
-	healthy  atomic.Bool
+	muIndex atomic.Int64
+	name    string
+	client  *http.Client
+	healthy atomic.Bool
+	// active counts the requests currently streaming through this transport. A
+	// vless listener can only be torn down once it reaches zero: killing the
+	// Xray process severs every tunnel it serves, which is what made long
+	// streams die mid-answer when the pool rotated.
+	active   atomic.Int64
 	checking atomic.Bool
+}
+
+// drain closes the idle connections of this transport and waits for the
+// in-flight requests to finish. It reports whether the transport went idle
+// within the budget; a false result tells the caller to leave the current exit
+// alone and retry the rotation later.
+func (t *proxyTransport) drain(budget time.Duration) bool {
+	if transport, ok := t.client.Transport.(*http.Transport); ok {
+		transport.CloseIdleConnections()
+	}
+	if t.active.Load() == 0 {
+		return true
+	}
+	deadline := time.Now().Add(budget)
+	for time.Now().Before(deadline) {
+		if t.active.Load() == 0 {
+			return true
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return t.active.Load() == 0
 }
 
 // index reports the transport's current position in the pool.
@@ -203,6 +229,19 @@ func (p *transportPool) healthCounts() (total, healthy int) {
 		}
 	}
 	return len(items), healthy
+}
+
+// Drain waits for the named transport to have no in-flight request left. A
+// missing address drains nothing and reports success, so a listener that is
+// already gone never blocks the caller.
+func (p *transportPool) Drain(name string, budget time.Duration) bool {
+	for _, proxy := range p.snapshot() {
+		if proxy.name != name {
+			continue
+		}
+		return proxy.drain(budget)
+	}
+	return true
 }
 
 func newTransportPool(proxies []string, cfg config.PerformanceConfig, responseHeaderTimeout time.Duration) (*transportPool, error) {
