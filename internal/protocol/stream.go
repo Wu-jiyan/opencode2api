@@ -15,7 +15,22 @@ var errStreamUpstreamFailure = errors.New("upstream stream failure delivered")
 
 var errStreamNormalTermination = errors.New("upstream stream terminated normally")
 
-var errSSEUnexpectedEOF = errors.New("unexpected end of SSE stream")
+// ErrSSETruncated reports an SSE stream that ended without its terminal event:
+// the upstream, or a tunnel on the way to it, closed the connection early.
+var ErrSSETruncated = errors.New("unexpected end of SSE stream")
+
+// ErrStreamRestartable reports a stream failure that happened before any byte
+// reached the downstream client. The whole upstream request can then be
+// replayed invisibly, so callers may retry it with a fresh attempt. Once
+// output has been forwarded the turn can no longer be replayed; the failure
+// must be reported in-band instead.
+var ErrStreamRestartable = errors.New("upstream stream failed before any output")
+
+// restartableStreamError marks cause as replayable. The cause is kept in the
+// message so logs and the final in-band error still say what actually happened.
+func restartableStreamError(cause error) error {
+	return fmt.Errorf("%w (%v)", ErrStreamRestartable, cause)
+}
 
 type streamTermination uint8
 
@@ -62,7 +77,12 @@ func (e *UpstreamStreamError) Error() string {
 // TranscodeStream is the request-aware form used by the
 // gateway. A cancelled client must not receive a synthetic upstream error
 // after its connection has gone away.
-func TranscodeStream(ctx context.Context, w http.ResponseWriter, reader io.Reader, from, to Protocol, model string) (Usage, error) {
+//
+// finalAttempt tells the function whether it is the caller's last try. On a
+// failure that produced no downstream output, a non-final call returns
+// ErrStreamRestartable and writes nothing, letting the caller replay the whole
+// upstream request; a final call reports the failure as an in-band error event.
+func TranscodeStream(ctx context.Context, w http.ResponseWriter, reader io.Reader, from, to Protocol, model string, finalAttempt bool) (Usage, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return Usage{}, fmt.Errorf("response writer does not support streaming")
@@ -81,6 +101,9 @@ func TranscodeStream(ctx context.Context, w http.ResponseWriter, reader io.Reade
 		events, err := parser.Parse(eventName, data)
 		if err != nil {
 			termination = streamErrorTermination
+			if !emitter.wrote && !finalAttempt {
+				return restartableStreamError(err)
+			}
 			if emitErr := emitter.Emit(bridgeStreamEvent{Kind: "error", Error: err.Error(), ErrorType: "upstream_error"}); emitErr != nil {
 				return emitErr
 			}
@@ -106,10 +129,16 @@ func TranscodeStream(ctx context.Context, w http.ResponseWriter, reader io.Reade
 		if errors.Is(readErr, errStreamNormalTermination) {
 			return emitter.usage, nil
 		}
+		if errors.Is(readErr, ErrStreamRestartable) {
+			return emitter.usage, readErr
+		}
 		if ClientCanceled(ctx, readErr) {
 			return emitter.usage, readErr
 		}
 		if termination == streamOpen {
+			if !emitter.wrote && !finalAttempt {
+				return emitter.usage, restartableStreamError(readErr)
+			}
 			if emitErr := emitUnexpectedStreamError(emitter, readErr); emitErr != nil {
 				return emitter.usage, emitErr
 			}
@@ -125,15 +154,18 @@ func TranscodeStream(ctx context.Context, w http.ResponseWriter, reader io.Reade
 	if ClientCanceled(ctx, nil) {
 		return emitter.usage, ctx.Err()
 	}
-	if err := emitUnexpectedStreamError(emitter, errSSEUnexpectedEOF); err != nil {
+	if !emitter.wrote && !finalAttempt {
+		return emitter.usage, restartableStreamError(ErrSSETruncated)
+	}
+	if err := emitUnexpectedStreamError(emitter, ErrSSETruncated); err != nil {
 		return emitter.usage, err
 	}
-	return emitter.usage, errSSEUnexpectedEOF
+	return emitter.usage, ErrSSETruncated
 }
 
 func emitUnexpectedStreamError(emitter *bridgeStreamEmitter, cause error) error {
 	message := "upstream SSE stream ended before a terminal event"
-	if cause != nil && !errors.Is(cause, errSSEUnexpectedEOF) {
+	if cause != nil && !errors.Is(cause, ErrSSETruncated) {
 		message = fmt.Sprintf("upstream SSE stream failed: %v", cause)
 	}
 	err := emitter.Emit(bridgeStreamEvent{Kind: "error", Error: message, ErrorType: "upstream_error"})
@@ -175,13 +207,29 @@ func (writer *sseFlushWriter) Write(data []byte) (int, error) {
 	return n, err
 }
 
-func ForwardStream(ctx context.Context, w http.ResponseWriter, reader io.Reader, protocol Protocol, model string) (Usage, error) {
+// maxStreamFrameBytes matches readSSE's scanner limit. A run of bytes with no
+// blank-line boundary growing past it is not SSE framing; forwarding it raw
+// keeps a non-SSE body from being buffered forever.
+const maxStreamFrameBytes = 16 << 20
+
+// ForwardStream relays a same-protocol SSE stream to the client. Only whole
+// frames are ever written: the bytes after the last blank-line boundary are
+// held back until they are complete, so a stream the upstream cuts mid-frame
+// never reaches the client as truncated JSON. The caller's error event is the
+// only thing the client sees for such a cut.
+//
+// finalAttempt tells the function whether it is the caller's last try. On a
+// failure that forwarded nothing, a non-final call returns
+// ErrStreamRestartable and writes nothing, letting the caller replay the whole
+// upstream request; a final call reports the failure as an in-band error event.
+func ForwardStream(ctx context.Context, w http.ResponseWriter, reader io.Reader, protocol Protocol, model string, finalAttempt bool) (Usage, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return Usage{}, fmt.Errorf("response writer does not support streaming")
 	}
 	observer := newStreamUsageObserver(protocol)
-	_, copyErr := io.Copy(&sseFlushWriter{writer: w, flusher: flusher, observer: observer}, reader)
+	forwarder := &sseFlushWriter{writer: w, flusher: flusher, observer: observer}
+	wrote, copyErr := forwardCompleteFrames(forwarder, reader)
 	usage := observer.Finish()
 	if observer.ErrorTermination() {
 		if copyErr != nil {
@@ -203,13 +251,91 @@ func ForwardStream(ctx context.Context, w http.ResponseWriter, reader io.Reader,
 		cause = copyErr
 	}
 	if cause == nil {
-		cause = errSSEUnexpectedEOF
+		cause = ErrSSETruncated
+	}
+	if !wrote && !finalAttempt {
+		return usage, restartableStreamError(cause)
 	}
 	emitter := newBridgeStreamEmitter(w, flusher, protocol, model)
 	if err := emitUnexpectedStreamError(emitter, cause); err != nil {
 		return usage, err
 	}
 	return usage, cause
+}
+
+// forwardCompleteFrames copies the upstream byte stream, writing only the
+// prefix that ends with a complete SSE frame boundary and holding the
+// unfinished tail back. On a clean close the tail is still forwarded: some
+// upstreams omit the trailing blank line after the terminal event, and a
+// pending record is the client's to judge. A read error means the frame was
+// cut mid-flight; the partial bytes are dropped because no client can parse
+// them, and the caller reports the failure itself. It reports whether any
+// byte reached the writer.
+func forwardCompleteFrames(writer io.Writer, reader io.Reader) (bool, error) {
+	wrote := false
+	chunk := make([]byte, 32<<10)
+	var pending []byte
+	// scanned is how much of pending has already been searched for a boundary.
+	// The last byte is always kept unsearched so a boundary split across two
+	// reads is still found.
+	scanned := 0
+	for {
+		n, readErr := reader.Read(chunk)
+		if n > 0 {
+			pending = append(pending, chunk[:n]...)
+			if cut := lastSSEBoundary(pending[scanned:]); cut >= 0 {
+				cut += scanned
+				if _, err := writer.Write(pending[:cut]); err != nil {
+					return wrote, err
+				}
+				wrote = true
+				pending = append(pending[:0], pending[cut:]...)
+				scanned = 0
+			} else if len(pending) > maxStreamFrameBytes {
+				if _, err := writer.Write(pending); err != nil {
+					return wrote, err
+				}
+				wrote = true
+				pending = pending[:0]
+				scanned = 0
+			} else {
+				// Keep the last three bytes unsearched: a \r\n\r\n boundary can
+				// straddle the next read and must still be found.
+				scanned = max(len(pending)-3, 0)
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) && len(pending) > 0 {
+				if _, err := writer.Write(pending); err != nil {
+					return wrote, err
+				}
+				wrote = true
+			}
+			if errors.Is(readErr, io.EOF) {
+				return wrote, nil
+			}
+			return wrote, readErr
+		}
+	}
+}
+
+// lastSSEBoundary returns the length of the longest prefix of data ending with
+// a blank-line SSE boundary, or -1 when data holds no complete frame. Both the
+// \n\n and the \r\n\r\n line endings are recognized, matching nextSSEBoundary.
+func lastSSEBoundary(data []byte) int {
+	cut := -1
+	for i := 0; i < len(data); i++ {
+		if data[i] == '\n' {
+			if i+1 < len(data) && data[i+1] == '\n' {
+				cut = i + 2
+			}
+			continue
+		}
+		if data[i] == '\r' && i+3 < len(data) && data[i+1] == '\n' && data[i+2] == '\r' && data[i+3] == '\n' {
+			cut = i + 4
+		}
+	}
+	return cut
 }
 
 type streamUsageObserver struct {
@@ -362,7 +488,7 @@ func readSSE(reader io.Reader, handler func(eventName, data string) error) error
 		// A blank line is the SSE record delimiter. Do not parse a final
 		// unterminated record as a complete frame; an EOF without a terminal
 		// event is handled by the caller as a truncated stream.
-		return errSSEUnexpectedEOF
+		return ErrSSETruncated
 	}
 	return nil
 }

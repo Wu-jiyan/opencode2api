@@ -43,6 +43,11 @@ type bridgeStreamEmitter struct {
 	tools map[string]*bridgeStreamTool
 	order []string
 
+	// wrote records whether any byte has been handed to the downstream writer.
+	// A failure while it is still false can be replayed by the caller; once it
+	// is true the client has seen output and the turn cannot be redone.
+	wrote bool
+
 	sequence        int
 	nextOutput      int
 	textOpen        bool
@@ -648,10 +653,12 @@ func (emitter *bridgeStreamEmitter) rawSSE(eventName, data string) error {
 		if _, err := fmt.Fprintf(emitter.w, "event: %s\n", eventName); err != nil {
 			return err
 		}
+		emitter.wrote = true
 	}
 	if _, err := fmt.Fprintf(emitter.w, "data: %s\n\n", data); err != nil {
 		return err
 	}
+	emitter.wrote = true
 	emitter.flush.Flush()
 	return nil
 }

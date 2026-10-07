@@ -13,9 +13,11 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"opencode2api/internal/config"
+	"opencode2api/internal/httpx"
 	"opencode2api/internal/identity"
 	"opencode2api/internal/jsonutil"
 	"opencode2api/internal/models"
@@ -204,32 +206,6 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 		stream := jsonutil.BoolAt(payload, "stream")
 		requestCtx, cancel := context.WithTimeout(r.Context(), time.Duration(g.cfg.Retry.TimeoutSeconds)*time.Second)
 		defer cancel()
-		resp, upstreamRoute, err := g.doUpstream(requestCtx, route, bodies, ids)
-		if err != nil {
-			finalTier := route.Tier
-			if meta != nil && meta.Tier != "" {
-				finalTier = config.Tier(meta.Tier)
-			}
-			keyID, channel, anonymous := requestCredential(requestCtx)
-			g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", finalTier, "key_id", keyID, "channel", channel, "anonymous", anonymous, "error", err)
-			// An exhausted request budget is a timeout, not a bad gateway: the
-			// distinction matters to clients that retry on 502.
-			if errors.Is(err, context.DeadlineExceeded) {
-				wire.WriteError(w, external, http.StatusGatewayTimeout, "upstream request timed out", "upstream_timeout", ids.Request)
-				return
-			}
-			wire.WriteError(w, external, http.StatusBadGateway, "all upstream attempts failed", "upstream_error", ids.Request)
-			return
-		}
-		defer resp.Body.Close()
-		if meta != nil {
-			meta.Tier = string(upstreamRoute.Tier)
-		}
-		w.Header().Set("x-request-id", ids.Request)
-		if resp.StatusCode/100 != 2 {
-			copyErrorResponse(w, external, resp, ids.Request)
-			return
-		}
 		if stream {
 			if meta != nil {
 				meta.Stream = true
@@ -238,73 +214,141 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 				g.monitor.BeginStream()
 				defer g.monitor.EndStream()
 			}
-			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-			w.Header().Set("Cache-Control", "no-cache")
-			w.Header().Set("X-Accel-Buffering", "no")
-			w.WriteHeader(resp.StatusCode)
-			var usage wire.Usage
-			if external == upstreamRoute.Protocol {
-				usage, err = wire.ForwardStream(r.Context(), w, resp.Body, upstreamRoute.Protocol, model)
-			} else {
-				usage, err = wire.TranscodeStream(r.Context(), w, resp.Body, upstreamRoute.Protocol, external, model)
+		}
+		// Upstream streams that die after the success status but before any byte
+		// reached the client are replayed here: nothing was written downstream,
+		// so a fresh attempt is invisible to the client. Each round re-enters the
+		// full tier/key/proxy rotation, and keys cooled by earlier rounds are
+		// skipped by the pool cursors, so a repeat lands on a different exit when
+		// one is available. Once the client has seen output the turn cannot be
+		// replayed and the failure is reported in-band instead.
+		headersCommitted := false
+		for attempt := 1; ; attempt++ {
+			// Continue the request-level attempt numbering across restart rounds
+			// so monitoring never shows duplicate attempt numbers for one request.
+			offset := 0
+			if meta != nil {
+				offset = meta.Attempts
+			}
+			resp, upstreamRoute, err := g.doUpstream(requestCtx, route, bodies, ids, offset)
+			if err != nil {
+				finalTier := route.Tier
+				if meta != nil && meta.Tier != "" {
+					finalTier = config.Tier(meta.Tier)
+				}
+				keyID, channel, anonymous := requestCredential(requestCtx)
+				g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", finalTier, "key_id", keyID, "channel", channel, "anonymous", anonymous, "error", err)
+				// An exhausted request budget is a timeout, not a bad gateway: the
+				// distinction matters to clients that retry on 502.
+				if errors.Is(err, context.DeadlineExceeded) {
+					wire.WriteError(w, external, http.StatusGatewayTimeout, "upstream request timed out", "upstream_timeout", ids.Request)
+					return
+				}
+				wire.WriteError(w, external, http.StatusBadGateway, "all upstream attempts failed", "upstream_error", ids.Request)
+				return
 			}
 			if meta != nil {
-				meta.Usage = usage
-				if err != nil {
+				meta.Tier = string(upstreamRoute.Tier)
+			}
+			w.Header().Set("x-request-id", ids.Request)
+			if resp.StatusCode/100 != 2 {
+				copyErrorResponse(w, external, resp, ids.Request)
+				httpx.DrainAndClose(resp.Body)
+				return
+			}
+			final := attempt >= g.cfg.Retry.MaxAttempts || requestCtx.Err() != nil || r.Context().Err() != nil
+			if stream {
+				w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+				w.Header().Set("Cache-Control", "no-cache")
+				w.Header().Set("X-Accel-Buffering", "no")
+				// A restartable failure writes nothing downstream, so the status
+				// line stays unsent and the retry round may run. WriteHeader is
+				// still guarded because repeating it would log a superfluous-call
+				// warning even for the same status.
+				if !headersCommitted {
+					w.WriteHeader(resp.StatusCode)
+					headersCommitted = true
+				}
+				var usage wire.Usage
+				if external == upstreamRoute.Protocol {
+					usage, err = wire.ForwardStream(r.Context(), w, resp.Body, upstreamRoute.Protocol, model, final)
+				} else {
+					usage, err = wire.TranscodeStream(r.Context(), w, resp.Body, upstreamRoute.Protocol, external, model, final)
+				}
+				if meta != nil {
+					meta.Usage = usage
+				}
+				if errors.Is(err, wire.ErrStreamRestartable) {
+					g.restartFailedStream(requestCtx, resp, attempt, err)
+					continue
+				}
+				httpx.DrainAndClose(resp.Body)
+				if meta != nil && err != nil {
 					meta.Outcome = "stream_error"
 					if wire.ClientCanceled(r.Context(), err) {
 						meta.Outcome = "client_canceled"
 					}
 				}
+				if err != nil && !errors.Is(err, context.Canceled) {
+					g.logger.Warn("downstream stream ended with an error", "component", "stream", "event", "stream_failed", "request_id", ids.Request, "model", model, "tier", upstreamRoute.Tier, "error", err)
+				}
+				return
 			}
-			if err != nil && !errors.Is(err, context.Canceled) {
-				g.logger.Warn("downstream stream ended with an error", "component", "stream", "event", "stream_failed", "request_id", ids.Request, "model", model, "tier", upstreamRoute.Tier, "error", err)
+			responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+			if readErr != nil {
+				if !final && isRestartableStreamRead(readErr) {
+					g.restartFailedStream(requestCtx, resp, attempt, readErr)
+					continue
+				}
+				httpx.DrainAndClose(resp.Body)
+				wire.WriteError(w, external, http.StatusBadGateway, "failed to read upstream response", "upstream_error", ids.Request)
+				return
 			}
-			return
-		}
-		responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-		if err != nil {
-			wire.WriteError(w, external, http.StatusBadGateway, "failed to read upstream response", "upstream_error", ids.Request)
-			return
-		}
-		if upstreamRoute.Anonymous || (meta != nil && meta.Shaped) {
-			// Key-tier shaped requests were force-streamed like the
-			// anonymous lane; collapse the same way.
-			// The anonymous lane is served streaming (see forceStreamBody);
-			// collapse the events back into the single document this
-			// non-streaming client asked for.
-			collapsed, err := wire.CollapseStream(bytes.NewReader(responseBody), upstreamRoute.Protocol, model)
-			if err != nil {
-				// An error the upstream reported inside the stream is not a
-				// conversion failure: it refused the request and said why, so
-				// relay that reason instead of a generic unsupported-response
-				// message that hides the actual cause.
-				var upstreamErr *wire.UpstreamStreamError
-				if errors.As(err, &upstreamErr) {
-					g.logger.Warn("upstream rejected the request inside the stream", "component", "upstream", "event", "upstream_stream_error", "request_id", ids.Request, "model", model, "tier", upstreamRoute.Tier, "anonymous", upstreamRoute.Anonymous, "upstream_type", upstreamErr.Type, "error", upstreamErr.Message)
-					wire.WriteError(w, external, http.StatusBadGateway, upstreamErr.Message, "upstream_error", ids.Request)
+			httpx.DrainAndClose(resp.Body)
+			if upstreamRoute.Anonymous || (meta != nil && meta.Shaped) {
+				// Key-tier shaped requests were force-streamed like the
+				// anonymous lane; collapse the same way.
+				// The anonymous lane is served streaming (see forceStreamBody);
+				// collapse the events back into the single document this
+				// non-streaming client asked for.
+				collapsed, collapseErr := wire.CollapseStream(bytes.NewReader(responseBody), upstreamRoute.Protocol, model)
+				if collapseErr != nil {
+					// An error the upstream reported inside the stream is not a
+					// conversion failure: it refused the request and said why, so
+					// relay that reason instead of a generic unsupported-response
+					// message that hides the actual cause.
+					var upstreamErr *wire.UpstreamStreamError
+					if errors.As(collapseErr, &upstreamErr) {
+						g.logger.Warn("upstream rejected the request inside the stream", "component", "upstream", "event", "upstream_stream_error", "request_id", ids.Request, "model", model, "tier", upstreamRoute.Tier, "anonymous", upstreamRoute.Anonymous, "upstream_type", upstreamErr.Type, "error", upstreamErr.Message)
+						wire.WriteError(w, external, http.StatusBadGateway, upstreamErr.Message, "upstream_error", ids.Request)
+						return
+					}
+					if !final && isRestartableStreamRead(collapseErr) {
+						g.restartFailedStream(requestCtx, resp, attempt, collapseErr)
+						continue
+					}
+					g.logger.Warn("anonymous stream collapse failed", "component", "conversion", "event", "anonymous_collapse_failed", "request_id", ids.Request, "model", model, "source_protocol", upstreamRoute.Protocol, "error", collapseErr)
+					wire.WriteError(w, external, http.StatusBadGateway, "unsupported upstream response", "upstream_error", ids.Request)
 					return
 				}
-				g.logger.Warn("anonymous stream collapse failed", "component", "conversion", "event", "anonymous_collapse_failed", "request_id", ids.Request, "model", model, "source_protocol", upstreamRoute.Protocol, "error", err)
-				wire.WriteError(w, external, http.StatusBadGateway, "unsupported upstream response", "upstream_error", ids.Request)
-				return
+				responseBody = collapsed
 			}
-			responseBody = collapsed
-		}
-		if meta != nil {
-			meta.Usage = wire.ResponseUsage(upstreamRoute.Protocol, responseBody)
-		}
-		if external != upstreamRoute.Protocol {
-			responseBody, err = wire.ConvertResponse(upstreamRoute.Protocol, external, responseBody)
-			if err != nil {
-				g.logger.Warn("response protocol conversion failed", "component", "conversion", "event", "response_conversion_failed", "request_id", ids.Request, "model", model, "source_protocol", upstreamRoute.Protocol, "target_protocol", external, "error", err)
-				wire.WriteError(w, external, http.StatusBadGateway, "unsupported upstream response", "upstream_error", ids.Request)
-				return
+			if meta != nil {
+				meta.Usage = wire.ResponseUsage(upstreamRoute.Protocol, responseBody)
 			}
+			if external != upstreamRoute.Protocol {
+				responseBody, err = wire.ConvertResponse(upstreamRoute.Protocol, external, responseBody)
+				if err != nil {
+					g.logger.Warn("response protocol conversion failed", "component", "conversion", "event", "response_conversion_failed", "request_id", ids.Request, "model", model, "source_protocol", upstreamRoute.Protocol, "target_protocol", external, "error", err)
+					wire.WriteError(w, external, http.StatusBadGateway, "unsupported upstream response", "upstream_error", ids.Request)
+					return
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(resp.StatusCode)
+			_, _ = w.Write(responseBody)
+			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(responseBody)
 	}
 }
 
@@ -375,7 +419,7 @@ func (g *Gateway) forwardSystemOne(w http.ResponseWriter, r *http.Request, body 
 	}
 	requestCtx, cancel := context.WithTimeout(r.Context(), time.Duration(g.cfg.Retry.TimeoutSeconds)*time.Second)
 	defer cancel()
-	resp, upstreamRoute, err := g.doUpstream(requestCtx, route, bodies, ids)
+	resp, upstreamRoute, err := g.doUpstream(requestCtx, route, bodies, ids, 0)
 	if err != nil {
 		finalTier := route.Tier
 		if meta != nil && meta.Tier != "" {
@@ -493,4 +537,33 @@ func copyErrorResponse(w http.ResponseWriter, protocol wire.Protocol, resp *http
 		message = jsonutil.FirstString(jsonutil.StringAt(value, "error", "message"), jsonutil.StringAt(value, "message"), message)
 	}
 	wire.WriteError(w, protocol, resp.StatusCode, message, "upstream_error", requestID)
+}
+
+// isRestartableStreamRead reports whether an error from consuming an upstream
+// body looks like the connection was cut rather than the upstream saying no.
+// Only those errors are worth a full replay attempt; a document the upstream
+// did deliver would fail the same way twice.
+func isRestartableStreamRead(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, wire.ErrSSETruncated) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EPIPE)
+}
+
+// restartFailedStream discards a response whose body died before the client
+// saw any output and prepares the retry round. The exit that served the dead
+// stream is asked to prove it is still reachable, but deliberately not marked
+// down on the stream failure alone: a truncated stream can come from the
+// upstream application just as well as from the tunnel, and only the
+// connection-level check may take an exit out of service.
+func (g *Gateway) restartFailedStream(ctx context.Context, resp *http.Response, attempt int, cause error) {
+	if proxy := attemptTransport(resp); proxy != nil {
+		g.verifyProxyAfterError(ctx, proxy, 0)
+	}
+	httpx.DrainAndClose(resp.Body)
+	g.logger.Warn("upstream stream died before any output; retrying", "component", "stream", "event", "stream_restart", "attempt", attempt, "error", cause)
 }

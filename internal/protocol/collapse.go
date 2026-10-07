@@ -64,7 +64,7 @@ func CollapseStream(reader io.Reader, protocol Protocol, model string) ([]byte, 
 		if streamErr != nil {
 			return nil, streamErr
 		}
-		return nil, errSSEUnexpectedEOF
+		return nil, ErrSSETruncated
 	}
 	return json.Marshal(encodeBridgeResponse(protocol, acc.response))
 }

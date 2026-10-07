@@ -24,8 +24,8 @@ import (
 	"opencode2api/internal/telemetry"
 )
 
-func (g *Gateway) doUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs) (*http.Response, models.Route, error) {
-	resp, effectiveRoute, attempts, err := g.doUpstreamTiers(ctx, route, bodies, ids, 0)
+func (g *Gateway) doUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, models.Route, error) {
+	resp, effectiveRoute, attempts, err := g.doUpstreamTiers(ctx, route, bodies, ids, attemptOffset)
 	if err != nil || resp == nil || resp.StatusCode != http.StatusBadRequest {
 		return resp, effectiveRoute, err
 	}
@@ -657,10 +657,12 @@ func upstreamStatus(resp *http.Response) int {
 
 // releaseOnClose ties an in-flight slot to the lifetime of the response body,
 // so a transport stays marked busy for as long as a stream is still being read
-// and goes idle exactly once the body is closed.
+// and goes idle exactly once the body is closed. The proxy reference lets the
+// caller attribute a mid-stream failure to the exit that served it.
 type releaseOnClose struct {
 	io.ReadCloser
 	release func()
+	proxy   *proxyTransport
 	once    sync.Once
 }
 
@@ -668,6 +670,18 @@ func (r *releaseOnClose) Close() error {
 	err := r.ReadCloser.Close()
 	r.once.Do(r.release)
 	return err
+}
+
+// attemptTransport returns the proxy exit that served a response, if the body
+// still carries the marker the transport attached when the request was sent.
+func attemptTransport(resp *http.Response) *proxyTransport {
+	if resp == nil {
+		return nil
+	}
+	if release, ok := resp.Body.(*releaseOnClose); ok {
+		return release.proxy
+	}
+	return nil
 }
 
 // do performs the request and keeps the transport marked busy until the
@@ -681,7 +695,7 @@ func (t *proxyTransport) do(req *http.Request) (*http.Response, error) {
 		t.active.Add(-1)
 		return resp, err
 	}
-	resp.Body = &releaseOnClose{ReadCloser: resp.Body, release: func() { t.active.Add(-1) }}
+	resp.Body = &releaseOnClose{ReadCloser: resp.Body, release: func() { t.active.Add(-1) }, proxy: t}
 	return resp, nil
 }
 
