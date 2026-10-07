@@ -156,6 +156,8 @@ Restart=always
 RestartSec=5
 # 允许 Xray 子进程
 KillMode=mixed
+# 每个 SSE 流都占用一个文件描述符，默认 1024 的软限制在并发下会耗尽
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target

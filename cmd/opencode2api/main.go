@@ -15,6 +15,7 @@ import (
 	"opencode2api/internal/buildinfo"
 	"opencode2api/internal/config"
 	"opencode2api/internal/gateway"
+	"opencode2api/internal/procs"
 	"opencode2api/internal/telemetry"
 )
 
@@ -33,6 +34,10 @@ func main() {
 		slog.Error("configuration error", "error", err)
 		os.Exit(1)
 	}
+	// Align the scheduler with a container or systemd CPU quota before any
+	// worker pool starts. The outcome is logged once the structured logger
+	// exists, a few lines below.
+	cpuBudget := procs.Limit()
 	if *listen != "" {
 		cfg.Listen = *listen
 	}
@@ -48,6 +53,9 @@ func main() {
 	redactor := config.NewSecretRedactor()
 	redactor.Replace(cfg)
 	logger := telemetry.NewStructuredLogger(level, hub, redactor)
+	if cpuBudget.Applied {
+		logger.Info("cpu quota detected; scheduler aligned with it", "component", "runtime", "event", "cpu_quota_applied", "quota_cores", cpuBudget.QuotaCores, "gomaxprocs", cpuBudget.Procs)
+	}
 	monitor := telemetry.NewMonitor()
 	manager, err := gateway.NewRuntimeManager(ctx, *configPath, cfg, logger, monitor, hub, redactor, level)
 	if err != nil {
