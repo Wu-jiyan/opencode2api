@@ -15,10 +15,16 @@ config.json.bak
 
 # 本地构建产物（webui/dist 例外：它随仓库提交并内嵌进可执行文件）
 /opencode2api
-/opencode2api.exe
+/opencode2api*.exe
 /opencode2api*.zip
 /opencode2api*.tar.gz
 /dist/
+
+# 第三方隧道工具与其配置：frp 的 toml 里带 auth.token 和证书路径，绝不入库
+/frp_*/
+/frpc.toml
+/frps.toml
+*.pem
 
 # 依赖与缓存目录
 node_modules/
