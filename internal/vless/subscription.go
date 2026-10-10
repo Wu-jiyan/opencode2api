@@ -2,6 +2,7 @@ package vless
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/url"
@@ -31,6 +32,14 @@ type Node struct {
 	SpiderX    string
 	// ClientFP is the uTLS fingerprint carried by the share link (fp=).
 	ClientFP string
+	// XHTTPMode is the xhttp transfer mode carried by the share link
+	// (mode=stream-one). Empty keeps xray's own default.
+	XHTTPMode string
+	// XHTTPExtra is the xhttp extra object carried by the share link
+	// (extra={"xPaddingObfsMode":true,...}). An edgetunnel Worker rejects a
+	// request whose padding parameters are missing, so these cannot be
+	// dropped: without them every xhttp request fails during the handshake.
+	XHTTPExtra map[string]any
 	// Fixed marks a node the operator configured by hand rather than one a
 	// subscription returned, so diagnostics can tell a stable route from a
 	// rotating candidate.
@@ -53,9 +62,20 @@ func (n Node) Endpoint() string {
 
 // Fingerprint returns a stable identity for the node's connection parameters.
 func (n Node) Fingerprint() string {
+	// The xhttp extras belong in the fingerprint: two links that differ only in
+	// their padding parameters reach different Workers, so a listener serving one
+	// of them cannot be reused for the other.
+	extra := ""
+	if len(n.XHTTPExtra) > 0 {
+		// encoding/json sorts map keys, so this is stable across runs.
+		if encoded, err := json.Marshal(n.XHTTPExtra); err == nil {
+			extra = string(encoded)
+		}
+	}
 	return strings.Join([]string{
 		n.Endpoint(), n.UUID, n.Network, n.Security, n.SNI, n.Host, n.Path,
 		n.Service, n.Flow, n.PublicKey, n.ShortID, strings.Join(n.ALPN, ","),
+		n.XHTTPMode, extra,
 	}, "|")
 }
 
@@ -163,6 +183,16 @@ func ParseURI(raw string) (Node, error) {
 		PublicKey:  query.Get("pbk"),
 		ShortID:    query.Get("sid"),
 		SpiderX:    query.Get("spx"),
+		XHTTPMode:  query.Get("mode"),
+	}
+	// The xhttp extras arrive URL-encoded JSON. A malformed object is ignored
+	// rather than rejected: a link without extras is still a usable node for
+	// every Worker that does not require padding obfuscation.
+	if raw := strings.TrimSpace(query.Get("extra")); raw != "" {
+		var extra map[string]any
+		if err := json.Unmarshal([]byte(raw), &extra); err == nil {
+			node.XHTTPExtra = extra
+		}
 	}
 	if alpn := query.Get("alpn"); alpn != "" {
 		for _, item := range strings.Split(alpn, ",") {

@@ -76,10 +76,19 @@ func streamSettings(node Node) (map[string]any, error) {
 			"headers": headersOrEmpty(node.Host),
 		}
 	case "xhttp":
-		stream["xhttpSettings"] = map[string]any{
-			"path": firstNonEmpty(node.Path, "/"),
-			"host": node.Host,
+		// xhttp needs the transfer mode and the padding extras the Worker was
+		// configured with. An edgetunnel Worker with obfuscation enabled rejects
+		// a request that arrives without them, so a node that parses them must
+		// also forward them. "host" is not an xhttp setting: the Host comes from
+		// the address/SNI, and emitting it here was silently ignored.
+		settings := map[string]any{"path": firstNonEmpty(node.Path, "/")}
+		if node.XHTTPMode != "" {
+			settings["mode"] = node.XHTTPMode
 		}
+		if len(node.XHTTPExtra) > 0 {
+			settings["extra"] = node.XHTTPExtra
+		}
+		stream["xhttpSettings"] = settings
 	case "tcp", "raw":
 		stream["network"] = "tcp"
 		stream["tcpSettings"] = map[string]any{"header": map[string]any{"type": "none"}}
