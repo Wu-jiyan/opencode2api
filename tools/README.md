@@ -15,17 +15,17 @@
 
 ## 环境变量
 
-| 变量 | 必需 | 说明 |
-|---|---|---|
-| `VLESS_UUID` | 是 | 节点 UUID |
-| `VLESS_SNI` | 是 | zone 主机名，须与节点里的 `sni`/`host` 一致 |
-| `VLESS_PATH` | 否 | 传输路径，默认 `/` |
-| `VLESS_NETWORK` | 否 | `ws`（默认）或 `xhttp` |
-| `VLESS_MODE` | 否 | xhttp 传输模式，如 `stream-one` |
-| `VLESS_EXTRA` | 否 | xhttp 的 `extra` JSON，如 padding 伪装参数 |
-| `XRAY_PATH` | 否 | Xray 可执行文件路径 |
-| `CF_TARGET_HOST` | 仅 `cf_ip_scan.py` | 要扫描的 zone 主机名 |
-| `SSE_PROBE_PORT_BASE` | 否 | 探测用本地 SOCKS 端口起始值 |
+| 变量                  | 必需               | 说明                                        |
+| --------------------- | ------------------ | ------------------------------------------- |
+| `VLESS_UUID`          | 是                 | 节点 UUID                                   |
+| `VLESS_SNI`           | 是                 | zone 主机名，须与节点里的 `sni`/`host` 一致 |
+| `VLESS_PATH`          | 否                 | 传输路径，默认 `/`                          |
+| `VLESS_NETWORK`       | 否                 | `ws`（默认）或 `xhttp`                      |
+| `VLESS_MODE`          | 否                 | xhttp 传输模式，如 `stream-one`             |
+| `VLESS_EXTRA`         | 否                 | xhttp 的 `extra` JSON，如 padding 伪装参数  |
+| `XRAY_PATH`           | 否                 | Xray 可执行文件路径                         |
+| `CF_TARGET_HOST`      | 仅 `cf_ip_scan.py` | 要扫描的 zone 主机名                        |
+| `SSE_PROBE_PORT_BASE` | 否                 | 探测用本地 SOCKS 端口起始值                 |
 
 ### PowerShell 示例
 
