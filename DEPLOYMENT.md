@@ -528,6 +528,28 @@ seq 1 120 | xargs -P 40 -I{} curl -s -o /dev/null -w '%{http_code}\n' --max-time
 | 找不到 `ip` 命令                       | 精简镜像缺 iproute2                                | 安装 `iproute2`，或设 `manage_addresses: false` 自行挂地址    |
 | 出口 IP 始终不变                       | **会话亲和性**：同一会话固定走同一出口（预期行为） | 压测时给每个请求带不同的 `x-session-id`                       |
 | vless 出口 IP 不变                     | `connection_rotation_seconds` 为 0，连接被复用     | 参考「轮换与连接复用」开启轮换（IPv6 池无效：源地址是钉死的） |
+| 大批量请求返回 429                     | 上游按**凭证**计量，不按 IP 计量                   | 见下节「429 与每日额度」                                      |
+
+### 429 与每日额度
+
+用匿名通道（`anonymous: true`）时，上游的 429 不是短时速率限制，而是**每日额度耗尽**。实测判据：
+
+- 把 256 个 IPv6 出口**全部用上**、以 480 并发冲击，仍然 444/480 收到 429 —— 说明限流挂在凭证上，**增加源地址不会增加额度**；
+- 429 响应带 `Retry-After`，其数值**精确等于"距离下一个 UTC 零点"的秒数**，并随墙钟同步递减（实测 90 秒内递减 90 秒），即额度按 UTC 日重置。
+
+判断方式：
+
+```bash
+curl -s -D - -o /dev/null -H "Authorization: Bearer $SERVER_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"big-pickle","messages":[{"role":"user","content":"ok"}],"max_tokens":4}' \
+  http://127.0.0.1:<API端口>/v1/chat/completions | grep -i retry-after
+```
+
+注意两点：
+
+1. 匿名通道走的是**全局共享**的 `public` 凭证，额度会被其他匿名用户同时消耗，因此它既小又不可预测。要稳定出量必须配置真实的 `zen_keys` / `go_keys`。
+2. 429 不会把出口标记为不可用（只有连接超时和拒绝才会），所以池子状态看起来一切正常，这是预期行为，不要去调健康检查。
 
 ## 接入聚合面板
 

@@ -347,7 +347,11 @@ ipv6://2001:db8:1234:5600::1002
 
 Both can run together. The transport list is assembled as static `proxies`, then the vless listeners, then the IPv6 source addresses.
 
-> **Honest boundary**: these exits share one `/56`, one host, and one ASN. If the upstream limits by **individual IP**, the pool widens the budget proportionally; if it limits by `/64` prefix, ASN, or account, the pool only improves stability. Confirm the behavior with `tools/check_egress_ip.py` before relying on it.
+> **Honest boundary (measured)**: these exits share one `/56`, one host, and one ASN. Measurement says the upstream **meters the credential, not the IP**: with all 256 exits in use and a 480-way burst, 444 of 480 requests came back `429`, and `Retry-After` pointed exactly at the next UTC midnight — a daily allowance reset. So:
+>
+> - **More addresses do not buy more budget.** The anonymous lane rides the globally shared `public` credential, whose daily allowance is consumed by every anonymous user, which makes it both small and unpredictable. Around 240 concurrent requests still passes cleanly (measured, zero failures); beyond that you hit the wall.
+> - **Volume comes from `zen_keys` / `go_keys`.** Real keys are metered per account, and they are what the existing rotation multiplies; the IPv6 pool's job is to spread each key's requests and to fail over when an exit misbehaves.
+> - **The stability gain is certain**: 240 concurrent requests with zero failures and a steady 1.0–1.2 s p50, with no third-party subscription and no Xray process involved.
 
 ### Automatic Xray download
 
