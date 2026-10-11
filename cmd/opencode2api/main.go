@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -89,9 +90,24 @@ func main() {
 	}
 }
 
+// serveHTTP binds the listener first and only then reports that the server is
+// up.
+//
+// Logging before ListenAndServe made the message a claim rather than an
+// observation: a port that was already taken still produced a "server
+// listening" line, so a failed start looked like a successful one and the real
+// failure had to be found in the follow-up error. Binding first also lets the
+// log carry the address that was actually bound, which matters when the
+// configuration asks for port 0.
 func serveHTTP(cancel context.CancelFunc, logger *slog.Logger, server *http.Server, component string) {
-	logger.Info("server listening", "component", component, "event", "server_started", "address", server.Addr, "version", buildinfo.Version)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	listener, err := net.Listen("tcp", server.Addr)
+	if err != nil {
+		logger.Error("server failed to bind", "component", component, "event", "server_bind_failed", "address", server.Addr, "error", err)
+		cancel()
+		return
+	}
+	logger.Info("server listening", "component", component, "event", "server_started", "address", listener.Addr().String(), "version", buildinfo.Version)
+	if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 		logger.Error("server stopped unexpectedly", "component", component, "event", "server_failed", "address", server.Addr, "error", err)
 		cancel()
 	}
