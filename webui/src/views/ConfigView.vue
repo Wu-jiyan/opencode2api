@@ -66,6 +66,15 @@ const form = reactive({
     subscriptionProxy: "",
     startupTimeoutSeconds: 15,
   },
+  ipv6Pool: {
+    enabled: false,
+    prefix: "",
+    interface: "eth0",
+    count: 64,
+    offset: 4096,
+    manageAddresses: true,
+    readyTimeoutSeconds: 30,
+  },
 });
 
 const secretNames = ["server_keys", "zen_keys", "go_keys", "proxies"];
@@ -138,6 +147,16 @@ function fill(value) {
     subscriptionProxy: vless.subscription_proxy || "",
     startupTimeoutSeconds: vless.startup_timeout_seconds ?? 15,
   });
+  const ipv6Pool = value.ipv6_pool || {};
+  Object.assign(form.ipv6Pool, {
+    enabled: !!ipv6Pool.enabled,
+    prefix: ipv6Pool.prefix || "",
+    interface: ipv6Pool.interface || "eth0",
+    count: ipv6Pool.count ?? 64,
+    offset: ipv6Pool.offset ?? 4096,
+    manageAddresses: ipv6Pool.manage_addresses ?? true,
+    readyTimeoutSeconds: ipv6Pool.ready_timeout_seconds ?? 30,
+  });
 
   secretNames.forEach((name) => {
     const items = value[name] || [];
@@ -209,6 +228,15 @@ async function save() {
         host: form.vless.host,
         subscription_proxy: form.vless.subscriptionProxy,
         startup_timeout_seconds: form.vless.startupTimeoutSeconds,
+      },
+      ipv6_pool: {
+        enabled: form.ipv6Pool.enabled,
+        prefix: form.ipv6Pool.prefix.trim(),
+        interface: form.ipv6Pool.interface.trim(),
+        count: form.ipv6Pool.count,
+        offset: form.ipv6Pool.offset,
+        manage_addresses: form.ipv6Pool.manageAddresses,
+        ready_timeout_seconds: form.ipv6Pool.readyTimeoutSeconds,
       },
       upstream: { zen: form.upZen, go: form.upGo },
       retry: {
@@ -501,6 +529,78 @@ onMounted(load);
               placeholder="socks5://127.0.0.1:1080"
             />
           </n-form-item>
+        </n-gi>
+      </n-grid>
+    </n-card>
+
+    <n-card title="IPv6 代理池" size="small" :bordered="false" class="block-gap">
+      <template #header-extra>
+        <span class="section-caption">从本机 IPv6 前缀挂出一组源地址，作为独立出口 IP</span>
+      </template>
+      <n-grid :cols="3" :x-gap="16">
+        <n-gi>
+          <n-form-item label="启用 IPv6 代理池" feedback="关闭时整块不生效，不影响其它配置">
+            <n-switch v-model:value="form.ipv6Pool.enabled" />
+          </n-form-item>
+        </n-gi>
+        <n-gi :span="2">
+          <n-form-item
+            label="IPv6 前缀（本机 on-link 的 CIDR）"
+            feedback="必须是合法 IPv6 CIDR，例如 2001:db8:1234:5600::/56"
+          >
+            <n-input v-model:value="form.ipv6Pool.prefix" placeholder="2001:db8:1234:5600::/56" />
+          </n-form-item>
+        </n-gi>
+        <n-gi>
+          <n-form-item label="网卡名" feedback="源地址挂在该网卡上">
+            <n-input v-model:value="form.ipv6Pool.interface" placeholder="eth0" />
+          </n-form-item>
+        </n-gi>
+        <n-gi>
+          <n-form-item label="出口地址数量" feedback="取值 1 ~ 1024">
+            <n-input-number
+              v-model:value="form.ipv6Pool.count"
+              :min="1"
+              :max="1024"
+              style="width: 100%"
+            />
+          </n-form-item>
+        </n-gi>
+        <n-gi>
+          <n-form-item
+            label="起始偏移"
+            feedback="从前缀内第 offset 个地址开始，避开主机自身占用的地址"
+          >
+            <n-input-number v-model:value="form.ipv6Pool.offset" :min="0" style="width: 100%" />
+          </n-form-item>
+        </n-gi>
+        <n-gi>
+          <n-form-item label="就绪超时（秒）" feedback="等待地址通过 DAD 转为可用的预算">
+            <n-input-number
+              v-model:value="form.ipv6Pool.readyTimeoutSeconds"
+              :min="0"
+              style="width: 100%"
+            />
+          </n-form-item>
+        </n-gi>
+        <n-gi :span="2">
+          <n-form-item
+            label="自动挂载地址"
+            feedback="开启后由程序执行 ip -6 addr add；关闭表示地址已由运维或容器预先挂好"
+          >
+            <n-switch v-model:value="form.ipv6Pool.manageAddresses" />
+          </n-form-item>
+        </n-gi>
+        <n-gi :span="3">
+          <n-alert type="info" :bordered="false" class="block-gap">
+            <template #default>
+              <span class="section-caption">
+                前缀内的地址会轮流作为出站源地址，出口 IP 由此分散；从前缀第 offset 个地址开始分配，
+                是为了跳过主机自身已占用的地址，因此 offset 应按实际网络规划留出余量。
+                自动挂载通常需要进程具备 root 或 CAP_NET_ADMIN 权限。
+              </span>
+            </template>
+          </n-alert>
         </n-gi>
       </n-grid>
     </n-card>

@@ -25,6 +25,7 @@ type Config struct {
 	Proxies     []string          `json:"proxies"`
 	ProxyFile   string            `json:"proxyfile"`
 	Vless       VlessConfig       `json:"vless"`
+	IPv6Pool    IPv6PoolConfig    `json:"ipv6_pool"`
 	Upstream    UpstreamConfig    `json:"upstream"`
 	Retry       RetryConfig       `json:"retry"`
 	Models      ModelsConfig      `json:"models"`
@@ -117,6 +118,44 @@ type VlessConfig struct {
 	// StartupTimeoutSeconds bounds how long a freshly started Xray process may
 	// take to accept connections on its listener.
 	StartupTimeoutSeconds int `json:"startup_timeout_seconds"`
+}
+
+// IPv6PoolConfig turns a set of source addresses taken from an on-link IPv6
+// prefix into extra exits. Once an address is assigned to the interface it is a
+// valid source for an outbound connection, and the upstream sees each one as a
+// different client, so the pool widens the rotation with no proxy process, no
+// tunnel handshake, and no external subscription to expire.
+//
+// The block is inert unless Enabled is set, so a configuration that never had
+// it keeps its direct, static, and vless behavior untouched.
+type IPv6PoolConfig struct {
+	Enabled bool `json:"enabled"`
+	// Prefix is the on-link prefix the addresses are drawn from, written as
+	// CIDR, for example "2001:db8:1234:5600::/56". The provider must already
+	// route the whole prefix to this host.
+	Prefix string `json:"prefix"`
+	// Interface is the network interface the addresses belong to. It is used
+	// when the pool assigns the addresses itself and when it checks which of
+	// them are already present.
+	Interface string `json:"interface"`
+	// Count is how many source addresses the pool keeps. Every address becomes
+	// one transport, so this trades rotation width against file descriptors
+	// and idle connections.
+	Count int `json:"count"`
+	// Offset is the first host index used inside the prefix. It keeps the pool
+	// clear of the address the provider configured on the host and of the low
+	// indices a hypervisor or router may reserve.
+	Offset int `json:"offset"`
+	// ManageAddresses lets the process assign the addresses itself with
+	// `ip -6 addr add`. Set it to false when the addresses are provisioned by
+	// the operator, by a container network, or by another agent; the pool then
+	// uses only the ones it can already bind.
+	ManageAddresses bool `json:"manage_addresses"`
+	// ReadyTimeoutSeconds bounds how long the pool waits for the addresses to
+	// pass duplicate address detection. A tentative address cannot be bound,
+	// so one that is not ready in time is reported and left out instead of
+	// failing the start.
+	ReadyTimeoutSeconds int `json:"ready_timeout_seconds"`
 }
 
 type RetryConfig struct {
@@ -217,6 +256,7 @@ func Load(path string) (Config, error) {
 		Logging:     LoggingConfig{Level: "info", RingSize: 2000},
 		WebUI:       WebUIConfig{Listen: "0.0.0.0:8081", SessionTTLMinutes: 720},
 		Vless:       VlessConfig{Count: 24, RefreshSeconds: 300, RotateBatch: 3, PortBase: 24000, Host: "127.0.0.1", StartupTimeoutSeconds: 15},
+		IPv6Pool:    IPv6PoolConfig{Interface: DefaultIPv6Interface, Count: DefaultIPv6PoolCount, Offset: DefaultIPv6PoolOffset, ManageAddresses: true, ReadyTimeoutSeconds: DefaultIPv6ReadyTimeoutSeconds},
 		Prefer:      TierGo,
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
@@ -308,6 +348,12 @@ func Normalize(path string, cfg Config) (Config, error) {
 		if raw == "direct" {
 			continue
 		}
+		// A local source address is not a proxy server URL: it binds the
+		// outgoing connection instead of forwarding it, so it is validated by
+		// its own parser rather than by url.Parse.
+		if _, ok := ParseIPv6ProxyAddr(raw); ok {
+			continue
+		}
 		u, err := url.Parse(raw)
 		if err != nil || u.Host == "" {
 			return Config{}, fmt.Errorf("invalid proxy URL %q", RedactURL(raw))
@@ -327,6 +373,9 @@ func Normalize(path string, cfg Config) (Config, error) {
 		return Config{}, err
 	}
 	if err := normalizeVless(&cfg); err != nil {
+		return Config{}, err
+	}
+	if err := normalizeIPv6Pool(&cfg); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil

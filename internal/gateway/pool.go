@@ -265,6 +265,27 @@ func (p *transportPool) Drain(name string, budget time.Duration) bool {
 	return true
 }
 
+// dialerFor builds the dialer for one pool entry and reports whether that
+// entry names a local source address.
+//
+// A local source address is not a proxy server: the connection still runs
+// straight to the upstream, but it leaves through the chosen address. Pinning
+// the local endpoint also restricts the dialer to destinations that address can
+// reach, so an IPv6 source resolves to the upstream's IPv6 addresses only, and
+// an unusable entry fails over through the ordinary pool machinery.
+func dialerFor(raw string, cfg config.PerformanceConfig) (*net.Dialer, bool) {
+	dialer := &net.Dialer{
+		Timeout:   time.Duration(cfg.ConnectTimeoutSeconds) * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	addr, ok := config.ParseIPv6ProxyAddr(raw)
+	if !ok {
+		return dialer, false
+	}
+	dialer.LocalAddr = &net.TCPAddr{IP: addr.AsSlice()}
+	return dialer, true
+}
+
 func newTransportPool(proxies []string, cfg config.PerformanceConfig, responseHeaderTimeout time.Duration) (*transportPool, error) {
 	p := &transportPool{items: make([]*proxyTransport, 0, len(proxies))}
 	for _, raw := range proxies {
@@ -275,11 +296,9 @@ func newTransportPool(proxies []string, cfg config.PerformanceConfig, responseHe
 		transport.IdleConnTimeout = idleConnTimeout(cfg)
 		transport.ResponseHeaderTimeout = responseHeaderTimeout
 		transport.ForceAttemptHTTP2 = true
-		transport.DialContext = (&net.Dialer{
-			Timeout:   time.Duration(cfg.ConnectTimeoutSeconds) * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext
-		if raw == "direct" {
+		dialer, isLocalSource := dialerFor(raw, cfg)
+		transport.DialContext = dialer.DialContext
+		if isLocalSource || raw == "direct" {
 			transport.Proxy = nil
 		} else {
 			u, err := url.Parse(raw)

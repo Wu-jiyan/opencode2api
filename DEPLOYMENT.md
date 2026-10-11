@@ -240,15 +240,15 @@ go build -o opencode2api.exe ./cmd/opencode2api
 
 ### 关键字段说明
 
-| 字段                   | 说明                                                                          |
-| ---------------------- | ----------------------------------------------------------------------------- |
-| `listen`               | API 监听地址。**保持 `127.0.0.1`**，除非你确实需要从外部直连                  |
-| `server_keys`          | 客户端调用本网关用的 Key，与上游 Key 完全独立                                 |
-| `zen_keys` / `go_keys` | 上游 Key，两个 Tier 独立成池                                                  |
-| `anonymous`            | `true` 时用 `public` 凭证访问符合条件的免费模型，无需上游 Key                 |
-| `prefer`               | `go`（默认）或 `zen`，决定优先尝试哪个认证 Tier                               |
-| `proxies`              | 代理列表，支持 `direct` / `http://` / `https://` / `socks5://` / `socks5h://` |
-| `webui.password`       | 仅首次启动使用：服务会把它转成 Argon2id 哈希写入 `password_hash` 并删除明文   |
+| 字段                   | 说明                                                                                            |
+| ---------------------- | ----------------------------------------------------------------------------------------------- |
+| `listen`               | API 监听地址。**保持 `127.0.0.1`**，除非你确实需要从外部直连                                    |
+| `server_keys`          | 客户端调用本网关用的 Key，与上游 Key 完全独立                                                   |
+| `zen_keys` / `go_keys` | 上游 Key，两个 Tier 独立成池                                                                    |
+| `anonymous`            | `true` 时用 `public` 凭证访问符合条件的免费模型，无需上游 Key                                   |
+| `prefer`               | `go`（默认）或 `zen`，决定优先尝试哪个认证 Tier                                                 |
+| `proxies`              | 代理列表，支持 `direct` / `http://` / `https://` / `socks5://` / `socks5h://` / `ipv6://<地址>` |
+| `webui.password`       | 仅首次启动使用：服务会把它转成 Argon2id 哈希写入 `password_hash` 并删除明文                     |
 
 完整字段见 `config.example.json` 与 README 的配置参考章节。
 
@@ -424,6 +424,79 @@ vless 池会占用 `port_base` 到 `port_base + count - 1` 的一段连续端口
 ```
 
 代价是每条新连接多约 0.6–1.3 秒（Cloudflare trace 类目标更高）。设为 `0` 关闭轮换。
+
+## IPv6 源地址池部署
+
+适用于机房给了你一段 on-link IPv6 前缀的机器（例如 `/56`）。相比 vless 池，它没有订阅额度、没有 Xray 进程、没有隧道握手，出口延迟最低、并发上限最高。
+
+> 下文示例统一使用 IPv6 文档保留前缀 `2001:db8:1234:5600::/56`。**请替换成你自己机器上实际拿到的前缀**，直接照抄示例是不会通的。
+
+### 前置条件
+
+1. **前缀确实 on-link 到本机** —— `ip -6 route show` 中能看到类似：
+
+```
+2001:db8:1234:5600::/56 dev eth0 proto kernel metric 256 pref medium
+```
+
+2. **确认挂上地址后出口随之变化**（这是整个方案的前提）：
+
+```bash
+ip -6 addr add 2001:db8:1234:5600::1002/56 dev eth0
+sleep 3   # 等 DAD 完成
+curl -6 -s https://api64.ipify.org --interface 2001:db8:1234:5600::1002
+# 期望输出：2001:db8:1234:5600::1002
+```
+
+两个必须注意的点：地址刚加入时处于 `tentative` 状态，此时 bind 会报 `errno 99 Cannot assign requested address`，`sleep` 后才会转正；地址必须**真正挂到网卡上**，直接 bind 一个前缀内未挂载的地址同样会 `errno 99`（`/56` 路由存在 ≠ 可任意 bind）。
+
+3. **确认上游接受该源地址**，且目标 API 的 IPv6 可达。
+
+### 配置
+
+```json
+"ipv6_pool": {
+  "enabled": true,
+  "prefix": "2001:db8:1234:5600::/56",
+  "interface": "eth0",
+  "count": 64,
+  "offset": 4096,
+  "manage_addresses": true,
+  "ready_timeout_seconds": 30
+}
+```
+
+- 需要 **root**（或具备 `CAP_NET_ADMIN`）才能执行 `ip -6 addr add`。
+- **容器部署**需 `network_mode: host`；默认 bridge 下前缀挂在宿主 netns，容器内 bind 必然失败。也可改用 macvlan 把前缀分给容器，并设 `manage_addresses: false`。
+- `count` 建议 **50–200**。每个地址一个 `http.Transport`，fd 与内存随 `count` 线性增长，盲目上几千只会线性增加开销。
+
+### 内核调优（大量并发时）
+
+```bash
+# 每个源地址拥有独立端口空间，N 个地址即 N 倍端口容量
+sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+# 连接跟踪上限，按目标并发上调
+sysctl -w net.netfilter.nf_conntrack_max=1048576
+sysctl -w net.ipv4.tcp_max_tw_buckets=262144
+```
+
+持久化写入 `/etc/sysctl.d/99-opencode2api.conf`。另外别忘进程 fd 上限（systemd 用 `LimitNOFILE=`，容器用 `--ulimit nofile=`）。
+
+### 验证出口确实在轮换
+
+```bash
+python3 tools/check_egress_ip.py     # 用法见 tools/README.md
+```
+
+### 常见故障
+
+| 现象                                   | 原因                                           | 处理                                                       |
+| -------------------------------------- | ---------------------------------------------- | ---------------------------------------------------------- |
+| 启动失败：`produced no usable address` | 网卡名写错、前缀未 on-link、或无权限挂地址     | 核对 `ip -6 route show` 与 `interface`，确认以 root 运行   |
+| 日志 `could not assign an address`     | 前缀长度与实际不符（如把 `/64` 写成 `/56`）    | 用 `ip -6 addr show dev eth0` 看真实长度                   |
+| 日志 `never became usable`             | DAD 未在预算内完成                             | 调大 `ready_timeout_seconds`，或减少 `count`               |
+| 找不到 `ip` 命令                       | 精简镜像缺 iproute2                            | 安装 `iproute2`，或设 `manage_addresses: false` 自行挂地址 |
+| 出口 IP 始终不变                       | `connection_rotation_seconds` 为 0，连接被复用 | 参考「轮换与连接复用」开启轮换                             |
 
 ## 接入聚合面板
 

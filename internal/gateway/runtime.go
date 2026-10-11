@@ -335,6 +335,9 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 		if proxy.name == "direct" {
 			status.Kind = "direct"
 		}
+		if _, isSource := config.ParseIPv6ProxyAddr(proxy.name); isSource {
+			status.Kind = "ipv6"
+		}
 		if node, ok := nodes[proxy.name]; ok {
 			status.Kind = "vless"
 			status.Node = node.Node

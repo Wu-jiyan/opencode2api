@@ -181,10 +181,11 @@ func (g *Gateway) StartProxyConnectionRotation(ctx context.Context) {
 }
 
 // StartProxyListSync keeps the transport pool aligned with the local SOCKS5
-// listeners the vless pool publishes. When the pool is disabled the desired
-// list equals the resolved proxy configuration and this loop is a no-op.
+// listeners the vless pool publishes and the source addresses the IPv6 pool
+// owns. When neither pool is enabled the desired list equals the resolved proxy
+// configuration and this loop is a no-op.
 func (g *Gateway) StartProxyListSync(ctx context.Context) {
-	if g.vlessPool == nil || !g.vlessPool.Enabled() {
+	if (g.vlessPool == nil || !g.vlessPool.Enabled()) && (g.ipv6Pool == nil || !g.ipv6Pool.Enabled()) {
 		return
 	}
 	reconcile := func() {
@@ -214,14 +215,17 @@ func (g *Gateway) StartProxyListSync(ctx context.Context) {
 }
 
 // desiredProxyList is the transport address list the gateway should be using:
-// the static proxies followed by the current vless listeners. A direct
-// connection is used only when neither source supplies a transport, so an
-// operator who removed `direct` from the configuration gets exactly the
-// proxies they asked for.
-func desiredProxyList(cfg config.Config, pool *vless.Pool) []string {
+// the static proxies, then the current vless listeners, then the local IPv6
+// source addresses. A direct connection is used only when no source supplies a
+// transport, so an operator who removed `direct` from the configuration gets
+// exactly the proxies they asked for.
+func desiredProxyList(cfg config.Config, pool *vless.Pool, ipv6Proxies []string) []string {
 	list := config.UniqueStrings(cfg.StaticProxies())
 	if pool != nil && pool.Enabled() {
 		list = config.UniqueStrings(append(list, pool.Proxies()...))
+	}
+	if len(ipv6Proxies) > 0 {
+		list = config.UniqueStrings(append(list, ipv6Proxies...))
 	}
 	if len(list) == 0 {
 		return []string{"direct"}
@@ -232,7 +236,11 @@ func desiredProxyList(cfg config.Config, pool *vless.Pool) []string {
 // desiredProxies is the transport address list the running gateway should be
 // using right now.
 func (g *Gateway) desiredProxies() []string {
-	return desiredProxyList(g.cfg, g.vlessPool)
+	var ipv6Proxies []string
+	if g.ipv6Pool != nil {
+		ipv6Proxies = g.ipv6Pool.Proxies()
+	}
+	return desiredProxyList(g.cfg, g.vlessPool, ipv6Proxies)
 }
 
 func equalProxies(desired []string, items []*proxyTransport) bool {

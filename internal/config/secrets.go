@@ -18,6 +18,12 @@ func MaskValue(value string) string {
 }
 
 func RedactURL(raw string) string {
+	// A local source address carries no credentials, and its trailing colons
+	// would make url.Parse read the last group as a port, so it passes through
+	// unchanged.
+	if _, ok := ParseIPv6ProxyAddr(raw); ok {
+		return raw
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return "<invalid>"

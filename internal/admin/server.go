@@ -116,6 +116,7 @@ type ConfigView struct {
 	Proxies     []SecretView             `json:"proxies"`
 	ProxyFile   string                   `json:"proxyfile"`
 	Vless       config.VlessConfig       `json:"vless"`
+	IPv6Pool    config.IPv6PoolConfig    `json:"ipv6_pool"`
 	Upstream    config.UpstreamConfig    `json:"upstream"`
 	Retry       config.RetryConfig       `json:"retry"`
 	Models      config.ModelsConfig      `json:"models"`
@@ -155,6 +156,7 @@ type ConfigUpdate struct {
 	Proxies     []SecretInput            `json:"proxies"`
 	ProxyFile   string                   `json:"proxyfile"`
 	Vless       config.VlessConfig       `json:"vless"`
+	IPv6Pool    config.IPv6PoolConfig    `json:"ipv6_pool"`
 	Upstream    config.UpstreamConfig    `json:"upstream"`
 	Retry       config.RetryConfig       `json:"retry"`
 	Models      config.ModelsConfig      `json:"models"`
@@ -206,6 +208,7 @@ func (a *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	candidate := config.Config{
 		Listen: update.Listen, ServerKeys: serverKeys, ZenKeys: zenKeys, GoKeys: goKeys, Anonymous: update.Anonymous, Proxies: proxies, ProxyFile: update.ProxyFile,
 		Vless:    update.Vless,
+		IPv6Pool: update.IPv6Pool,
 		Upstream: update.Upstream, Retry: update.Retry, Models: update.Models, Performance: update.Performance, Logging: update.Logging, Prefer: update.Prefer,
 		Reasoning: reasoning,
 		WebUI:     config.WebUIConfig{Enabled: update.WebUI.Enabled, Listen: update.WebUI.Listen, Username: current.WebUI.Username, PasswordHash: current.WebUI.PasswordHash, SessionTTLMinutes: update.WebUI.SessionTTLMinutes},
@@ -319,12 +322,23 @@ func (a *Server) sessionTokenValid(token string) bool {
 func (a *Server) configView() ConfigView {
 	cfg := a.manager.Config()
 	effective, restart := a.manager.RestartStatus()
+	return configViewFrom(cfg, EffectiveView{Listen: effective.API, WebUIListen: effective.WebUI, WebUIEnabled: effective.WebUIEnabled}, restart)
+}
+
+// configViewFrom projects a resolved configuration into the management view.
+//
+// It is a pure function so a test can prove that every configuration block
+// reaches the console. A block left out of this projection still takes effect
+// in the running service, which is what makes the omission hard to notice: the
+// operator sees the block at its zero value while the gateway keeps using the
+// configured one.
+func configViewFrom(cfg config.Config, effective EffectiveView, restart []string) ConfigView {
 	return ConfigView{
 		Listen: cfg.Listen, ServerKeys: maskSecrets(cfg.ServerKeys, false), ZenKeys: maskSecrets(cfg.ZenKeys, false), GoKeys: maskSecrets(cfg.GoKeys, false), Anonymous: cfg.Anonymous,
-		Proxies: maskSecrets(cfg.Proxies, true), ProxyFile: cfg.ProxyFile, Vless: cfg.Vless, Upstream: cfg.Upstream, Retry: cfg.Retry, Models: cfg.Models,
+		Proxies: maskSecrets(cfg.Proxies, true), ProxyFile: cfg.ProxyFile, Vless: cfg.Vless, IPv6Pool: cfg.IPv6Pool, Upstream: cfg.Upstream, Retry: cfg.Retry, Models: cfg.Models,
 		Performance: cfg.Performance, Logging: cfg.Logging, Prefer: cfg.Prefer, Reasoning: cfg.Reasoning,
 		WebUI:     WebUIView{Enabled: cfg.WebUI.Enabled, Listen: cfg.WebUI.Listen, Username: cfg.WebUI.Username, SessionTTLMinutes: cfg.WebUI.SessionTTLMinutes},
-		Effective: EffectiveView{Listen: effective.API, WebUIListen: effective.WebUI, WebUIEnabled: effective.WebUIEnabled},
+		Effective: effective,
 		Restart:   restart,
 	}
 }

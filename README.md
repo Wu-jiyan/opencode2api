@@ -294,6 +294,60 @@ Besides a subscription you can configure fixed `vless://` links directly. That s
 
 Fixed-node candidates are ordered by measured latency, so the fastest take the earlier slots. Ranking runs in the background and never blocks startup, and a candidate that cannot be dialed sorts last instead of being dropped, which keeps the pool from shrinking below the configured `count`.
 
+### IPv6 source address pool
+
+When the provider routes an on-link IPv6 prefix (a `/56`, for example) to the host, **every address inside that prefix is a valid source for an outbound connection**, and the upstream sees each one as a different client. These exits need no proxy process, no tunnel handshake, and no third-party subscription, so they carry neither a provider request quota nor the failure modes of an expiring subscription or a node going dark.
+
+```json
+"ipv6_pool": {
+  "enabled": true,
+  "prefix": "2001:db8:1234:5600::/56",
+  "interface": "eth0",
+  "count": 64,
+  "offset": 4096,
+  "manage_addresses": true,
+  "ready_timeout_seconds": 30
+}
+```
+
+| Field                             | Default | Meaning                                                                           |
+| --------------------------------- | ------- | --------------------------------------------------------------------------------- |
+| `ipv6_pool.enabled`               | `false` | Inert while off, so direct / static proxies / vless are untouched.                |
+| `ipv6_pool.prefix`                | Empty   | Required when enabled. The on-link prefix, `/64` or shorter.                      |
+| `ipv6_pool.interface`             | `eth0`  | Interface the addresses belong to.                                                |
+| `ipv6_pool.count`                 | `64`    | How many source addresses to keep, at most 1024. Each one becomes a transport.    |
+| `ipv6_pool.offset`                | `4096`  | First host index used, keeping clear of the host's own address.                   |
+| `ipv6_pool.manage_addresses`      | `true`  | Assign the addresses with `ip -6 addr add`; set false when provisioned elsewhere. |
+| `ipv6_pool.ready_timeout_seconds` | `30`    | Budget for waiting out duplicate address detection.                               |
+
+Behavior worth knowing:
+
+- **Addresses are deterministic**: `prefix + offset + i`, so a restart reuses the same set instead of accumulating new addresses on the interface.
+- **They must be ready before any transport is built**: a freshly added address is `tentative` and binding it fails outright. The pool waits for each address to become usable and **drops only the ones that never do**, so a single slow address never costs the whole rotation.
+- **A pool with no usable address fails the start** rather than silently falling back to `direct`, which would hide a misconfiguration behind traffic leaving from the wrong place.
+- **Addresses are not removed on shutdown**: that avoids a restart race, and deterministic generation means nothing leaks.
+- **Automatic assignment is Linux-only.** On other platforms set `manage_addresses: false` and provision the addresses outside the gateway.
+
+A single source address can also be written by hand in `proxies`, independently of the pool:
+
+```
+ipv6://2001:db8:1234:5600::1002
+```
+
+#### Choosing between this and the vless pool
+
+|                  | vless pool                                                   | IPv6 source pool                          |
+| ---------------- | ------------------------------------------------------------ | ----------------------------------------- |
+| Exit location    | Remote real nodes                                            | Many source addresses in one local prefix |
+| Depends on       | Subscription, node health, Xray processes                    | Only the interface                        |
+| Rotation cost    | Rebuilding an Xray process (drain and truncated-stream risk) | Swapping a source address, stateless      |
+| Request budget   | Bounded by the subscription provider                         | No third-party quota                      |
+| Block resistance | Strong (different networks and ASNs)                         | Weak (one `/56`, one ASN)                 |
+
+Both can run together. The transport list is assembled as static `proxies`, then the vless listeners, then the IPv6 source addresses.
+
+> **Honest boundary**: these exits share one `/56`, one host, and one ASN. If the upstream limits by **individual IP**, the pool widens the budget proportionally; if it limits by `/64` prefix, ASN, or account, the pool only improves stability. Confirm the behavior with `tools/check_egress_ip.py` before relying on it.
+
 ### Automatic Xray download
 
 With `vless.enabled` on and no Xray executable found, the gateway downloads the official release **in the background** (startup is never blocked) into `bin/xray/` under the configuration directory, and reuses it on restart. The sequence is:

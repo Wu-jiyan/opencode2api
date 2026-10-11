@@ -21,7 +21,10 @@ const cards = reactive([
   { key: "active", label: "当前并发", note: "请求 / 流式", value: "—" },
 ]);
 
-const kindLabels = { vless: "VLESS", direct: "直连", static: "静态" };
+const kindLabels = { vless: "VLESS", direct: "直连", static: "静态", ipv6: "IPv6 池" };
+// 与标签文案配套：vless 走订阅/固定节点，IPv6 池是按前缀挂出来的本机源地址，
+// 两者来源不同，用不同颜色区分，其余静态与直连保持默认样式。
+const kindTagTypes = { vless: "info", ipv6: "warning" };
 
 function latencyTag(probe) {
   if (probe.ok) {
@@ -49,7 +52,7 @@ const proxyColumns = [
       h("div", { class: "proxy-name", title: row.address }, [
         h(
           NTag,
-          { type: row.kind === "vless" ? "info" : "default", size: "small", bordered: false },
+          { type: kindTagTypes[row.kind] || "default", size: "small", bordered: false },
           { default: () => kindLabels[row.kind] || row.kind },
         ),
         // 固定节点与订阅候选的运维含义不同：前者是手动指定的稳定路由，

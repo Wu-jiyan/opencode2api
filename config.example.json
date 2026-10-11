@@ -23,6 +23,15 @@
     "subscription_proxy": "",
     "startup_timeout_seconds": 15
   },
+  "ipv6_pool": {
+    "enabled": false,
+    "prefix": "2001:db8:1234:5600::/56",
+    "interface": "eth0",
+    "count": 64,
+    "offset": 4096,
+    "manage_addresses": true,
+    "ready_timeout_seconds": 30
+  },
   "upstream": {
     "zen": "https://opencode.ai/zen",
     "go": "https://opencode.ai/zen/go"

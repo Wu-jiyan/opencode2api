@@ -19,6 +19,7 @@ import (
 	"opencode2api/internal/config"
 	"opencode2api/internal/httpx"
 	"opencode2api/internal/identity"
+	"opencode2api/internal/ipv6pool"
 	"opencode2api/internal/jsonutil"
 	"opencode2api/internal/models"
 	wire "opencode2api/internal/protocol"
@@ -48,6 +49,10 @@ type Gateway struct {
 	// vlessPool serves the vless subscription as local SOCKS5 listeners. It is
 	// a no-op pool when the feature is disabled.
 	vlessPool *vless.Pool
+	// ipv6Pool supplies extra exits from this host's own routed IPv6 prefix.
+	// Each exit is a local source address rather than a proxy server. It is a
+	// no-op pool when the feature is disabled.
+	ipv6Pool *ipv6pool.Pool
 	// refreshMu serializes catalog refreshes so a manual refresh cannot stack
 	// on top of the scheduled one.
 	refreshMu sync.Mutex
@@ -55,10 +60,19 @@ type Gateway struct {
 
 func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*Gateway, error) {
 	vlessPool := vless.New(cfg.Vless, cfg.Dir(), logger)
-	// The local listeners are appended after the static proxies, so a
-	// configured direct or static route keeps priority and the vless pool
-	// widens the rotation instead of replacing it.
-	transports, err := newTransportPool(desiredProxyList(cfg, vlessPool), cfg.Performance, cfg.Performance.AttemptTimeout(time.Duration(cfg.Retry.TimeoutSeconds)*time.Second))
+	// The source addresses must be on the interface before any transport is
+	// built on them: binding an address that duplicate address detection has
+	// not released yet fails outright, so a pool prepared later would only
+	// contribute dead exits. Prepare is bounded by its own readiness budget.
+	ipv6Pool := ipv6pool.New(cfg.IPv6Pool, logger)
+	if err := ipv6Pool.Prepare(context.Background()); err != nil {
+		vlessPool.Stop()
+		return nil, err
+	}
+	// The local listeners and source addresses are appended after the static
+	// proxies, so a configured direct or static route keeps priority and the
+	// other pools widen the rotation instead of replacing it.
+	transports, err := newTransportPool(desiredProxyList(cfg, vlessPool, ipv6Pool.Proxies()), cfg.Performance, cfg.Performance.AttemptTimeout(time.Duration(cfg.Retry.TimeoutSeconds)*time.Second))
 	if err != nil {
 		vlessPool.Stop()
 		return nil, err
@@ -93,6 +107,7 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 		catalog:    catalog,
 		monitor:    monitor,
 		vlessPool:  vlessPool,
+		ipv6Pool:   ipv6Pool,
 	}, nil
 }
 
