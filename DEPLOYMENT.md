@@ -484,19 +484,50 @@ sysctl -w net.ipv4.tcp_max_tw_buckets=262144
 
 ### 验证出口确实在轮换
 
+分两层验证，缺一层都可能得出错误结论。
+
+**第一层：源地址绑定是否生效**（OS 层，与网关无关）。池内每个地址都应当以自己的 IP 出网：
+
 ```bash
-python3 tools/check_egress_ip.py     # 用法见 tools/README.md
+for n in 4096 4159; do
+  addr=$(printf '%s::%x' "$PREFIX_BASE" "$n")
+  printf '%s -> ' "$addr"
+  curl -6 -s https://cloudflare.com/cdn-cgi/trace --interface "$addr" | grep '^ip='
+done
 ```
+
+**第二层：网关是否真的把流量铺开。** 这里有个关键前提：**出口选择带会话亲和性**（上游对 prompt cache 命中给奖励），同一会话固定走同一出口，只有不同会话才分散。所以：
+
+- 压测必须给每个请求带上不同的 `x-session-id`，否则全部请求被判定为同一会话，只会用到 1 个出口；
+- 或直接看并发时的连接数，它应当接近 `count` 而不是 1：
+
+```bash
+ss -tnp state established | grep opencode2api \
+  | grep -oE '\[[0-9a-f:]+\]' | sort -u | wc -l
+```
+
+并发压测示例（40 并发、120 请求、每请求独立会话）：
+
+```bash
+seq 1 120 | xargs -P 40 -I{} curl -s -o /dev/null -w '%{http_code}\n' --max-time 180 \
+  -H "Authorization: Bearer $SERVER_KEY" -H 'Content-Type: application/json' \
+  -H 'x-session-id: lt-{}' \
+  -d '{"model":"big-pickle","messages":[{"role":"user","content":"ok"}],"max_tokens":4}' \
+  http://127.0.0.1:8080/v1/chat/completions | sort | uniq -c
+```
+
+`tools/check_egress_ip.py`（见 `tools/README.md`）面向 vless 场景，IPv6 池请用上面的方式。
 
 ### 常见故障
 
-| 现象                                   | 原因                                           | 处理                                                       |
-| -------------------------------------- | ---------------------------------------------- | ---------------------------------------------------------- |
-| 启动失败：`produced no usable address` | 网卡名写错、前缀未 on-link、或无权限挂地址     | 核对 `ip -6 route show` 与 `interface`，确认以 root 运行   |
-| 日志 `could not assign an address`     | 前缀长度与实际不符（如把 `/64` 写成 `/56`）    | 用 `ip -6 addr show dev eth0` 看真实长度                   |
-| 日志 `never became usable`             | DAD 未在预算内完成                             | 调大 `ready_timeout_seconds`，或减少 `count`               |
-| 找不到 `ip` 命令                       | 精简镜像缺 iproute2                            | 安装 `iproute2`，或设 `manage_addresses: false` 自行挂地址 |
-| 出口 IP 始终不变                       | `connection_rotation_seconds` 为 0，连接被复用 | 参考「轮换与连接复用」开启轮换                             |
+| 现象                                   | 原因                                               | 处理                                                          |
+| -------------------------------------- | -------------------------------------------------- | ------------------------------------------------------------- |
+| 启动失败：`produced no usable address` | 网卡名写错、前缀未 on-link、或无权限挂地址         | 核对 `ip -6 route show` 与 `interface`，确认以 root 运行      |
+| 日志 `could not assign an address`     | 前缀长度与实际不符（如把 `/64` 写成 `/56`）        | 用 `ip -6 addr show dev eth0` 看真实长度                      |
+| 日志 `never became usable`             | DAD 未在预算内完成                                 | 调大 `ready_timeout_seconds`，或减少 `count`                  |
+| 找不到 `ip` 命令                       | 精简镜像缺 iproute2                                | 安装 `iproute2`，或设 `manage_addresses: false` 自行挂地址    |
+| 出口 IP 始终不变                       | **会话亲和性**：同一会话固定走同一出口（预期行为） | 压测时给每个请求带不同的 `x-session-id`                       |
+| vless 出口 IP 不变                     | `connection_rotation_seconds` 为 0，连接被复用     | 参考「轮换与连接复用」开启轮换（IPv6 池无效：源地址是钉死的） |
 
 ## 接入聚合面板
 

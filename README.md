@@ -327,6 +327,7 @@ Behavior worth knowing:
 - **A pool with no usable address fails the start** rather than silently falling back to `direct`, which would hide a misconfiguration behind traffic leaving from the wrong place.
 - **Addresses are not removed on shutdown**: that avoids a restart race, and deterministic generation means nothing leaks.
 - **Automatic assignment is Linux-only.** On other platforms set `manage_addresses: false` and provision the addresses outside the gateway.
+- **The pool spreads across conversations, not across requests.** Exit selection carries session affinity, because the upstream rewards prompt-cache hits: **one conversation stays on one exit IP**, and only different conversations fan out over different addresses. A load test that repeats an identical body without a session header derives one conversation from the first user message and therefore uses a single exit — that is the intended behavior, not a pool that failed to engage. To observe the spread, vary `x-session-id` per request.
 
 A single source address can also be written by hand in `proxies`, independently of the pool:
 
