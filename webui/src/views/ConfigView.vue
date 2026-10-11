@@ -72,10 +72,16 @@ const form = reactive({
     interface: "eth0",
     count: 64,
     offset: 4096,
+    spread: "subnet",
     manageAddresses: true,
     readyTimeoutSeconds: 30,
   },
 });
+
+const ipv6SpreadOptions = [
+  { label: "subnet（跨 /64 铺开，推荐）", value: "subnet" },
+  { label: "address（同一 /64 内连续）", value: "address" },
+];
 
 const secretNames = ["server_keys", "zen_keys", "go_keys", "proxies"];
 // 首次渲染发生在 onMounted 拉取配置之前，因此这里先给出完整形状。
@@ -154,6 +160,7 @@ function fill(value) {
     interface: ipv6Pool.interface || "eth0",
     count: ipv6Pool.count ?? 64,
     offset: ipv6Pool.offset ?? 4096,
+    spread: ipv6Pool.spread || "subnet",
     manageAddresses: ipv6Pool.manage_addresses ?? true,
     readyTimeoutSeconds: ipv6Pool.ready_timeout_seconds ?? 30,
   });
@@ -235,6 +242,7 @@ async function save() {
         interface: form.ipv6Pool.interface.trim(),
         count: form.ipv6Pool.count,
         offset: form.ipv6Pool.offset,
+        spread: form.ipv6Pool.spread,
         manage_addresses: form.ipv6Pool.manageAddresses,
         ready_timeout_seconds: form.ipv6Pool.readyTimeoutSeconds,
       },
@@ -583,7 +591,19 @@ onMounted(load);
             />
           </n-form-item>
         </n-gi>
-        <n-gi :span="2">
+        <n-gi>
+          <n-form-item
+            label="地址铺开方式"
+            feedback="subnet：每个 /64 只放一个地址（推荐）；address：全部挤在同一个 /64 内"
+          >
+            <n-select
+              v-model:value="form.ipv6Pool.spread"
+              :options="ipv6SpreadOptions"
+              style="width: 100%"
+            />
+          </n-form-item>
+        </n-gi>
+        <n-gi>
           <n-form-item
             label="自动挂载地址"
             feedback="开启后由程序执行 ip -6 addr add；关闭表示地址已由运维或容器预先挂好"

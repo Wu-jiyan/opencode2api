@@ -461,6 +461,7 @@ curl -6 -s https://api64.ipify.org --interface 2001:db8:1234:5600::1002
   "interface": "eth0",
   "count": 64,
   "offset": 4096,
+  "spread": "subnet",
   "manage_addresses": true,
   "ready_timeout_seconds": 30
 }
@@ -468,7 +469,8 @@ curl -6 -s https://api64.ipify.org --interface 2001:db8:1234:5600::1002
 
 - 需要 **root**（或具备 `CAP_NET_ADMIN`）才能执行 `ip -6 addr add`。
 - **容器部署**需 `network_mode: host`；默认 bridge 下前缀挂在宿主 netns，容器内 bind 必然失败。也可改用 macvlan 把前缀分给容器，并设 `manage_addresses: false`。
-- `count` 建议 **50–200**。每个地址一个 `http.Transport`，fd 与内存随 `count` 线性增长，盲目上几千只会线性增加开销。
+- **`spread` 必须保持 `subnet`。** 上游按 `/64` 前缀计量，这个字段决定池子看起来是 1 个客户端还是 256 个。设成 `address` 会把所有地址挤进同一个 `/64`，加再多地址也只算一份额度。
+- `count` 建议 **不超过前缀里的 `/64` 数量**（`/56` 即 256）。每个地址一个 `http.Transport`，fd 与内存随 `count` 线性增长；超过块数后会往每个 `/64` 里放第二个地址，收益递减。
 
 ### 内核调优（大量并发时）
 
@@ -528,18 +530,30 @@ seq 1 120 | xargs -P 40 -I{} curl -s -o /dev/null -w '%{http_code}\n' --max-time
 | 找不到 `ip` 命令                       | 精简镜像缺 iproute2                                | 安装 `iproute2`，或设 `manage_addresses: false` 自行挂地址    |
 | 出口 IP 始终不变                       | **会话亲和性**：同一会话固定走同一出口（预期行为） | 压测时给每个请求带不同的 `x-session-id`                       |
 | vless 出口 IP 不变                     | `connection_rotation_seconds` 为 0，连接被复用     | 参考「轮换与连接复用」开启轮换（IPv6 池无效：源地址是钉死的） |
-| 大批量请求返回 429                     | 上游按**凭证**计量，不按 IP 计量                   | 见下节「429 与每日额度」                                      |
+| 大批量请求返回 429                     | 上游按 **`/64` 前缀**计量，且额度每日重置          | 确认 `spread: subnet`，见下节「429 与每日额度」               |
 
 ### 429 与每日额度
 
-用匿名通道（`anonymous: true`）时，上游的 429 不是短时速率限制，而是**每日额度耗尽**。实测判据：
+用匿名通道（`anonymous: true`）时，上游的 429 不是短时速率限制，而是**按 `/64` 前缀计量、每日重置的额度耗尽**。实测判据：
 
-- 把 256 个 IPv6 出口**全部用上**、以 480 并发冲击，仍然 444/480 收到 429 —— 说明限流挂在凭证上，**增加源地址不会增加额度**；
-- 429 响应带 `Retry-After`，其数值**精确等于"距离下一个 UTC 零点"的秒数**，并随墙钟同步递减（实测 90 秒内递减 90 秒），即额度按 UTC 日重置。
+- 把 256 个地址**全挤在同一个 `/64`** 里、以 480 并发冲击，444/480 收到 429，`Retry-After` 精确等于"距下一个 UTC 零点"的秒数（实测相差 1–2 秒，且 90 秒墙钟内递减 90 秒）；
+- 随后把出口换到一个**从未使用过的 `/64`**，同一模型**立刻恢复 200**。
 
-判断方式：
+结论：**限流既不按单个地址，也不是全局，而是按 `/64` 分桶。** 所以 `spread: subnet` 是这个功能成立的前提——一个 `/56` 含 256 个 `/64`，就是 256 份独立额度。
+
+自检方式：
 
 ```bash
+# 1) 当前出口落在哪些 /64（应当分散，而不是全在同一个）
+ss -tnp state established | grep opencode2api \
+  | grep -oE '\[[0-9a-f:]+\]' | tr -d '[]' \
+  | python3 -c "
+import sys, ipaddress
+blocks = {ipaddress.IPv6Network((int(ipaddress.IPv6Address(l.strip()))>>64<<64, 64)) for l in sys.stdin if l.strip()}
+print('使用中的 /64 数量:', len(blocks))
+for b in sorted(blocks)[:5]: print(' ', b)"
+
+# 2) 是否被限流、额度何时重置
 curl -s -D - -o /dev/null -H "Authorization: Bearer $SERVER_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"model":"big-pickle","messages":[{"role":"user","content":"ok"}],"max_tokens":4}' \
@@ -548,8 +562,8 @@ curl -s -D - -o /dev/null -H "Authorization: Bearer $SERVER_KEY" \
 
 注意两点：
 
-1. 匿名通道走的是**全局共享**的 `public` 凭证，额度会被其他匿名用户同时消耗，因此它既小又不可预测。要稳定出量必须配置真实的 `zen_keys` / `go_keys`。
-2. 429 不会把出口标记为不可用（只有连接超时和拒绝才会），所以池子状态看起来一切正常，这是预期行为，不要去调健康检查。
+1. 429 不会把出口标记为不可用（只有连接超时和拒绝才会），所以池子状态看起来一切正常，这是预期行为，不要去调健康检查。
+2. 单份额度有限（实测一个 `/64` 约 1200–1500 次请求后触发）。要更高总量，就提高可用的 `/64` 数量，或叠加真实的 `zen_keys` / `go_keys`。
 
 ## 接入聚合面板
 

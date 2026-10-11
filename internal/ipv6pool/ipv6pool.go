@@ -83,7 +83,7 @@ func (p *Pool) Prepare(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("ipv6 pool prefix: %w", err)
 	}
-	addresses, ok := config.GenerateIPv6Addresses(prefix, p.cfg.Offset, p.cfg.Count)
+	addresses, ok := config.GenerateIPv6Addresses(prefix, p.cfg.Offset, p.cfg.Count, p.cfg.Spread)
 	if !ok {
 		return fmt.Errorf("ipv6 pool range starting at offset %d with count %d does not fit inside %s", p.cfg.Offset, p.cfg.Count, prefix)
 	}
@@ -106,7 +106,7 @@ func (p *Pool) Prepare(ctx context.Context) error {
 	}
 	if p.logger != nil {
 		p.logger.Info("IPv6 source pool ready", "component", "proxy", "event", "ipv6_pool_ready",
-			"interface", p.cfg.Interface, "prefix", prefix.String(), "requested", len(addresses), "ready", len(ready))
+			"interface", p.cfg.Interface, "prefix", prefix.String(), "spread", p.cfg.Spread, "requested", len(addresses), "ready", len(ready))
 	}
 	return nil
 }

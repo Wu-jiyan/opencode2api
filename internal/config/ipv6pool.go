@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math/big"
 	"net/netip"
 	"strings"
 )
@@ -29,6 +30,25 @@ const (
 	// IPv6ProxyScheme marks a transport that leaves through a chosen local
 	// source address rather than through a proxy server.
 	IPv6ProxyScheme = "ipv6"
+
+	// SpreadSubnet puts one address in each /64 before adding a second address
+	// to any of them.
+	//
+	// Rate limiters key on the /64 rather than on the individual address,
+	// because a /64 is the smallest block a provider hands out and the
+	// smallest unit a client is expected to own. Measured against OpenCode
+	// Zen: 256 addresses packed into one /64 shared a single allowance, while
+	// the same addresses placed in separate /64s were metered separately — a
+	// fresh /64 answered 200 while the hammered one returned 429. This is the
+	// default because it is the layout that widens the budget; packing the
+	// addresses together leaves the pool looking like one client.
+	SpreadSubnet = "subnet"
+	// SpreadAddress packs the addresses consecutively inside a single /64.
+	// Choose it when the limiter really is per address, or when the prefix is
+	// itself a /64 and there is nowhere to spread.
+	SpreadAddress = "address"
+	// DefaultIPv6PoolSpread is the layout used when none is configured.
+	DefaultIPv6PoolSpread = SpreadSubnet
 )
 
 // normalizeIPv6Pool fills defaults and validates the pool settings. The block
@@ -38,6 +58,7 @@ func normalizeIPv6Pool(cfg *Config) error {
 	pool := &cfg.IPv6Pool
 	pool.Prefix = strings.TrimSpace(pool.Prefix)
 	pool.Interface = strings.TrimSpace(pool.Interface)
+	pool.Spread = strings.ToLower(strings.TrimSpace(pool.Spread))
 	if !pool.Enabled {
 		return nil
 	}
@@ -74,61 +95,81 @@ func normalizeIPv6Pool(cfg *Config) error {
 	if pool.Offset == 0 {
 		pool.Offset = DefaultIPv6PoolOffset
 	}
+	if pool.Spread == "" {
+		pool.Spread = DefaultIPv6PoolSpread
+	}
+	if pool.Spread != SpreadSubnet && pool.Spread != SpreadAddress {
+		return fmt.Errorf("ipv6_pool.spread must be %q or %q", SpreadSubnet, SpreadAddress)
+	}
 	if pool.ReadyTimeoutSeconds < 0 {
 		return errors.New("ipv6_pool.ready_timeout_seconds must not be negative")
 	}
 	if pool.ReadyTimeoutSeconds == 0 {
 		pool.ReadyTimeoutSeconds = DefaultIPv6ReadyTimeoutSeconds
 	}
-	if _, ok := GenerateIPv6Addresses(prefix, pool.Offset, pool.Count); !ok {
+	if _, ok := GenerateIPv6Addresses(prefix, pool.Offset, pool.Count, pool.Spread); !ok {
 		return fmt.Errorf("ipv6_pool.offset %d with count %d does not fit inside %s", pool.Offset, pool.Count, prefix)
 	}
 	return nil
 }
 
-// GenerateIPv6Addresses returns the addresses the pool uses, starting Offset
-// host indices into prefix. The choice is deterministic, so a restart reuses
-// the same addresses instead of accumulating new ones on the interface. A
-// false result means the requested range does not fit inside the prefix.
-func GenerateIPv6Addresses(prefix netip.Prefix, offset, count int) ([]netip.Addr, bool) {
+// GenerateIPv6Addresses returns the addresses the pool uses for the requested
+// layout. The choice is deterministic, so a restart reuses the same addresses
+// instead of accumulating new ones on the interface. A false result means the
+// requested range does not fit inside the prefix.
+//
+// With SpreadSubnet the addresses walk the /64 blocks the prefix contains, so
+// a /56 with count 256 yields one address in each of its 256 blocks; beyond
+// that, a second address lands in each block. With SpreadAddress they are
+// consecutive inside the first block.
+func GenerateIPv6Addresses(prefix netip.Prefix, offset, count int, spread string) ([]netip.Addr, bool) {
 	if count < 1 || offset < 0 {
 		return nil, false
 	}
-	current, ok := addHostIndex(prefix.Masked().Addr(), uint64(offset))
-	if !ok {
-		return nil, false
-	}
+	blocks := subnetBlocks(prefix, count)
+	blockStride := new(big.Int).Lsh(big.NewInt(1), 64)
+	baseOctets := prefix.Masked().Addr().As16()
+	base := new(big.Int).SetBytes(baseOctets[:])
+
 	addresses := make([]netip.Addr, 0, count)
 	for i := 0; i < count; i++ {
-		if i > 0 {
-			next, ok := addHostIndex(current, 1)
-			if !ok {
-				return nil, false
-			}
-			current = next
+		blockIndex, hostIndex := int64(0), int64(offset+i)
+		if spread == SpreadSubnet {
+			blockIndex, hostIndex = int64(i%blocks), int64(offset+i/blocks)
 		}
-		if !prefix.Contains(current) || current.Is4In6() {
+		value := new(big.Int).Add(base, new(big.Int).Mul(big.NewInt(blockIndex), blockStride))
+		value.Add(value, big.NewInt(hostIndex))
+		if value.BitLen() > 128 {
 			return nil, false
 		}
-		addresses = append(addresses, current)
+		var octets [16]byte
+		value.FillBytes(octets[:])
+		address := netip.AddrFrom16(octets)
+		if !prefix.Contains(address) || address.Is4In6() {
+			return nil, false
+		}
+		addresses = append(addresses, address)
 	}
 	return addresses, true
 }
 
-// addHostIndex adds a host-index delta to an address, reporting overflow past
-// the end of the 128-bit space. The addition is big-endian because the host
-// index occupies the low-order bytes.
-func addHostIndex(addr netip.Addr, delta uint64) (netip.Addr, bool) {
-	octets := addr.As16()
-	for i := len(octets) - 1; i >= 0 && delta > 0; i-- {
-		sum := uint64(octets[i]) + (delta & 0xff)
-		octets[i] = byte(sum)
-		delta = (delta >> 8) + (sum >> 8)
+// subnetBlocks counts how many /64 blocks the subnet layout can spread over.
+// A /64 prefix contains exactly one, and the count caps the value so the walk
+// never needs more blocks than there are addresses to place.
+func subnetBlocks(prefix netip.Prefix, count int) int {
+	subnetBits := 64 - prefix.Bits()
+	if subnetBits <= 0 {
+		return 1
 	}
-	if delta != 0 {
-		return netip.Addr{}, false
+	if subnetBits >= 31 {
+		// Far more blocks than the pool can use; the count bounds the index and
+		// keeps the shift in range.
+		return count
 	}
-	return netip.AddrFrom16(octets), true
+	if capacity := 1 << subnetBits; capacity < count {
+		return capacity
+	}
+	return count
 }
 
 // IPv6ProxyURL renders the transport address the gateway publishes for one

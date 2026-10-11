@@ -146,6 +146,14 @@ type IPv6PoolConfig struct {
 	// clear of the address the provider configured on the host and of the low
 	// indices a hypervisor or router may reserve.
 	Offset int `json:"offset"`
+	// Spread selects how the addresses are laid out inside the prefix, and it
+	// is what decides whether the pool looks like one client or many.
+	//
+	// "subnet" (the default) walks the /64 blocks the prefix contains, one
+	// address at a time, because rate limiters key on the /64 rather than on
+	// the individual address. "address" packs them consecutively inside the
+	// first /64, which is right only when the limiter is per address.
+	Spread string `json:"spread"`
 	// ManageAddresses lets the process assign the addresses itself with
 	// `ip -6 addr add`. Set it to false when the addresses are provisioned by
 	// the operator, by a container network, or by another agent; the pool then
@@ -256,7 +264,7 @@ func Load(path string) (Config, error) {
 		Logging:     LoggingConfig{Level: "info", RingSize: 2000},
 		WebUI:       WebUIConfig{Listen: "0.0.0.0:8081", SessionTTLMinutes: 720},
 		Vless:       VlessConfig{Count: 24, RefreshSeconds: 300, RotateBatch: 3, PortBase: 24000, Host: "127.0.0.1", StartupTimeoutSeconds: 15},
-		IPv6Pool:    IPv6PoolConfig{Interface: DefaultIPv6Interface, Count: DefaultIPv6PoolCount, Offset: DefaultIPv6PoolOffset, ManageAddresses: true, ReadyTimeoutSeconds: DefaultIPv6ReadyTimeoutSeconds},
+		IPv6Pool:    IPv6PoolConfig{Interface: DefaultIPv6Interface, Count: DefaultIPv6PoolCount, Offset: DefaultIPv6PoolOffset, Spread: DefaultIPv6PoolSpread, ManageAddresses: true, ReadyTimeoutSeconds: DefaultIPv6ReadyTimeoutSeconds},
 		Prefer:      TierGo,
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))

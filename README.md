@@ -310,19 +310,21 @@ When the provider routes an on-link IPv6 prefix (a `/56`, for example) to the ho
 }
 ```
 
-| Field                             | Default | Meaning                                                                           |
-| --------------------------------- | ------- | --------------------------------------------------------------------------------- |
-| `ipv6_pool.enabled`               | `false` | Inert while off, so direct / static proxies / vless are untouched.                |
-| `ipv6_pool.prefix`                | Empty   | Required when enabled. The on-link prefix, `/64` or shorter.                      |
-| `ipv6_pool.interface`             | `eth0`  | Interface the addresses belong to.                                                |
-| `ipv6_pool.count`                 | `64`    | How many source addresses to keep, at most 1024. Each one becomes a transport.    |
-| `ipv6_pool.offset`                | `4096`  | First host index used, keeping clear of the host's own address.                   |
-| `ipv6_pool.manage_addresses`      | `true`  | Assign the addresses with `ip -6 addr add`; set false when provisioned elsewhere. |
-| `ipv6_pool.ready_timeout_seconds` | `30`    | Budget for waiting out duplicate address detection.                               |
+| Field                             | Default  | Meaning                                                                                                                                        |
+| --------------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ipv6_pool.enabled`               | `false`  | Inert while off, so direct / static proxies / vless are untouched.                                                                             |
+| `ipv6_pool.prefix`                | Empty    | Required when enabled. The on-link prefix, `/64` or shorter.                                                                                   |
+| `ipv6_pool.interface`             | `eth0`   | Interface the addresses belong to.                                                                                                             |
+| `ipv6_pool.count`                 | `64`     | How many source addresses to keep, at most 1024. Each one becomes a transport.                                                                 |
+| `ipv6_pool.offset`                | `4096`   | First host index used inside each `/64`, keeping clear of the host's address.                                                                  |
+| `ipv6_pool.spread`                | `subnet` | How addresses are laid out across `/64` blocks. `subnet` puts one address in each (recommended); `address` packs them all into a single `/64`. |
+| `ipv6_pool.manage_addresses`      | `true`   | Assign the addresses with `ip -6 addr add`; set false when provisioned elsewhere.                                                              |
+| `ipv6_pool.ready_timeout_seconds` | `30`     | Budget for waiting out duplicate address detection.                                                                                            |
 
 Behavior worth knowing:
 
-- **Addresses are deterministic**: `prefix + offset + i`, so a restart reuses the same set instead of accumulating new addresses on the interface.
+- **Addresses are deterministic**: a restart reuses the same set instead of accumulating new addresses on the interface.
+- **They must be spread across `/64` blocks**: the upstream meters the **`/64`**, not the individual address. `spread: subnet` (the default) distributes the pool over the blocks the prefix contains — a `/56` is 256 blocks, hence 256 separate allowances — while `spread: address` packs every address into one `/64`, which reads as a single client no matter how many addresses it holds. See the boundary note below.
 - **They must be ready before any transport is built**: a freshly added address is `tentative` and binding it fails outright. The pool waits for each address to become usable and **drops only the ones that never do**, so a single slow address never costs the whole rotation.
 - **A pool with no usable address fails the start** rather than silently falling back to `direct`, which would hide a misconfiguration behind traffic leaving from the wrong place.
 - **Addresses are not removed on shutdown**: that avoids a restart race, and deterministic generation means nothing leaks.
@@ -347,11 +349,12 @@ ipv6://2001:db8:1234:5600::1002
 
 Both can run together. The transport list is assembled as static `proxies`, then the vless listeners, then the IPv6 source addresses.
 
-> **Honest boundary (measured)**: these exits share one `/56`, one host, and one ASN. Measurement says the upstream **meters the credential, not the IP**: with all 256 exits in use and a 480-way burst, 444 of 480 requests came back `429`, and `Retry-After` pointed exactly at the next UTC midnight — a daily allowance reset. So:
+> **Honest boundary (measured)**: the upstream meters the **`/64` prefix** — not the individual address, and not globally. The evidence: with all 256 addresses packed into **one `/64`** and a 480-way burst, 444 of 480 came back `429`, and `Retry-After` pointed exactly at the next UTC midnight (a daily reset; measured within 1–2 s of the seconds-to-midnight and counting down in step with the wall clock). Repointing the exit at a **`/64` that had never carried traffic** answered `200` immediately for the same model. So:
 >
-> - **More addresses do not buy more budget.** The anonymous lane rides the globally shared `public` credential, whose daily allowance is consumed by every anonymous user, which makes it both small and unpredictable. Around 240 concurrent requests still passes cleanly (measured, zero failures); beyond that you hit the wall.
-> - **Volume comes from `zen_keys` / `go_keys`.** Real keys are metered per account, and they are what the existing rotation multiplies; the IPv6 pool's job is to spread each key's requests and to fail over when an exit misbehaves.
+> - **`spread: subnet` is what makes this feature work.** One `/56` holds 256 `/64` blocks, hence 256 separate allowances; packing the addresses into one block is the same as using one client. **The distribution across `/64` blocks is the lever — the address count alone is not.**
+> - **The allowance resets daily at UTC midnight** and a single block is finite: in this measurement one `/64` was throttled after roughly 1200–1500 requests.
 > - **The stability gain is certain**: 240 concurrent requests with zero failures and a steady 1.0–1.2 s p50, with no third-party subscription and no Xray process involved.
+> - When one host's blocks are still not enough, add real `zen_keys` / `go_keys`, which are metered per account.
 
 ### Automatic Xray download
 

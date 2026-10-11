@@ -29,6 +29,7 @@
     "interface": "eth0",
     "count": 64,
     "offset": 4096,
+    "spread": "subnet",
     "manage_addresses": true,
     "ready_timeout_seconds": 30
   },
