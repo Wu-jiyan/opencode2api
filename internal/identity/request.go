@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"net/http"
 	"regexp"
+	"strconv"
 
 	"opencode2api/internal/jsonutil"
 )
@@ -83,27 +84,78 @@ func StableID(prefix, value string) string {
 	return prefix + "_" + hex.EncodeToString(sum[:12])
 }
 
-// canonicalSessionPattern matches OpenCode's canonical session format:
-// "ses_" + 12 lowercase hex timestamp characters + 14 Base62 characters.
-// Since 2026-09-16 the Zen free tier (Authorization: Bearer public) rejects
-// any other session shape with 403 FreeTierError.
+// canonicalSessionPattern matches OpenCode's canonical session shape:
+// "ses_" + 12 lowercase hex characters + 14 Base62 characters.
 var canonicalSessionPattern = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
 
-const base62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+const (
+	base62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-// CanonicalSessionID returns signal unchanged when it already carries an
-// official OpenCode session (preserving upstream prompt-cache affinity).
-// Any other downstream identity (UUIDs, foreign client sessions, legacy
-// gateway sessions, conversation seeds) is deterministically hashed into the
-// canonical shape so the same conversation keeps a stable session.
+	// sessionCounterMax bounds the counter field encoded into the leading hex
+	// characters of a session id.
+	//
+	// The Zen free tier does not merely shape-check those characters. Upstream
+	// (packages/schema/src/identifier.ts) builds them as the low 48 bits of
+	// (timestamp*0x1000 + counter), bit-inverted for a session so that newer
+	// ids sort first, and decodes them again to reject ids no real client could
+	// have produced. Measured against the live gate on 2026-10-13 with every
+	// other request property held constant:
+	//
+	//	ses_<sha256 cut>          -> 403 FreeTierError
+	//	ses_...(counter 1)        -> 200
+	//	ses_...(counter 15)       -> 200
+	//	ses_...(counter 255)      -> 403 FreeTierError
+	//	ascending (not inverted)  -> 403 FreeTierError
+	//	any timestamp (epoch 0, 7 days old, or random) -> 200
+	//
+	// So the timestamp need only be inverted, while the counter must stay
+	// small. 15 is the largest value measured to be accepted, and it also
+	// reproduces the "ff0".."ffe" tail a real client emits.
+	sessionCounterMax = 15
+)
+
+// CanonicalSessionID returns signal unchanged when it already carries a session
+// a real OpenCode client could have issued (preserving upstream prompt-cache
+// affinity). Any other downstream identity (UUIDs, foreign client sessions,
+// legacy gateway sessions, conversation seeds) is deterministically encoded
+// into the canonical shape so the same conversation keeps a stable session.
 func CanonicalSessionID(signal string) string {
-	if canonicalSessionPattern.MatchString(signal) {
+	if validCanonicalSessionID(signal) {
 		return signal
 	}
 	sum := sha256.Sum256([]byte("ses\x00" + signal))
-	timePart := hex.EncodeToString(sum[:6])
+	prefix := encodeSessionPrefix(sum[:6])
 	randomPart := base62Fixed(new(big.Int).SetBytes(sum[6:16]), 14)
-	return "ses_" + timePart + randomPart
+	return "ses_" + prefix + randomPart
+}
+
+// encodeSessionPrefix renders 48 bits of digest as the 12 leading hex
+// characters upstream decodes as an inverted (timestamp*0x1000 + counter)
+// value. Both fields are taken from the digest, which keeps the id a pure
+// function of the conversation signal while still carrying a counter small
+// enough for the free-tier gate to accept.
+func encodeSessionPrefix(digest []byte) string {
+	value := uint64(digest[0])<<40 | uint64(digest[1])<<32 | uint64(digest[2])<<24 |
+		uint64(digest[3])<<16 | uint64(digest[4])<<8 | uint64(digest[5])
+	timestamp := value & 0xFFFFFFFFF // low 36 bits: the decoded millisecond field
+	counter := 1 + (value>>36)%sessionCounterMax
+	current := timestamp<<12 | counter
+	return fmt.Sprintf("%012x", ^current&0xFFFFFFFFFFFF)
+}
+
+// validCanonicalSessionID reports whether an id already matches both the shape
+// and the inverted-timestamp semantics the free tier checks. A shape-only match
+// is not enough: forwarding one makes upstream answer 403 FreeTierError.
+func validCanonicalSessionID(value string) bool {
+	if !canonicalSessionPattern.MatchString(value) {
+		return false
+	}
+	stored, err := strconv.ParseUint(value[4:16], 16, 64)
+	if err != nil {
+		return false
+	}
+	counter := (^stored & 0xFFFFFFFFFFFF) & 0xFFF
+	return counter >= 1 && counter <= sessionCounterMax
 }
 
 func base62Fixed(n *big.Int, width int) string {
