@@ -349,12 +349,28 @@ ipv6://2001:db8:1234:5600::1002
 
 Both can run together. The transport list is assembled as static `proxies`, then the vless listeners, then the IPv6 source addresses.
 
-> **Honest boundary (measured)**: the upstream meters the **`/64` prefix** — not the individual address, and not globally. The evidence: with all 256 addresses packed into **one `/64`** and a 480-way burst, 444 of 480 came back `429`, and `Retry-After` pointed exactly at the next UTC midnight (a daily reset; measured within 1–2 s of the seconds-to-midnight and counting down in step with the wall clock). Repointing the exit at a **`/64` that had never carried traffic** answered `200` immediately for the same model. So:
+> **Honest boundary (measured under the pre-2026-10-11 gate; not re-measured since the 2026-10-13 tightening, so rule out 403 via "The free tier's client contract" below before relying on it)**: the upstream meters the **`/64` prefix** — not the individual address, and not globally. The evidence: with all 256 addresses packed into **one `/64`** and a 480-way burst, 444 of 480 came back `429`, and `Retry-After` pointed exactly at the next UTC midnight (a daily reset; measured within 1–2 s of the seconds-to-midnight and counting down in step with the wall clock). Repointing the exit at a **`/64` that had never carried traffic** answered `200` immediately for the same model. So:
 >
 > - **`spread: subnet` is what makes this feature work.** One `/56` holds 256 `/64` blocks, hence 256 separate allowances; packing the addresses into one block is the same as using one client. **The distribution across `/64` blocks is the lever — the address count alone is not.**
 > - **The allowance resets daily at UTC midnight** and a single block is finite: in this measurement one `/64` was throttled after roughly 1200–1500 requests.
 > - **The stability gain is certain**: 240 concurrent requests with zero failures and a steady 1.0–1.2 s p50, with no third-party subscription and no Xray process involved.
 > - When one host's blocks are still not enough, add real `zen_keys` / `go_keys`, which are metered per account.
+
+#### The free tier's client contract (where 403 comes from)
+
+The anonymous free tier (`anonymous: true`) has a client-identity gate that is **completely independent of the exit IP**. When a request does not satisfy the contract, the upstream answers `403 FreeTierError` (`OpenCode's free tier can only be used from within OpenCode`) for **every free model on every exit**. Adding more source addresses or more `/64` blocks does nothing here — this is not throttling, it is the request shape being refused. The contract has three parts:
+
+| Requirement       | Meaning                                                                                                                                                                                        |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `stream: true`    | Chat requests must stream. The gateway forces this and folds the stream back into JSON for clients that asked for a plain reply.                                                               |
+| Tool set          | The body must declare OpenCode's tools. `bash` + `read` is the measured minimum; either one alone, or a differently cased name (`Bash`), is refused. The gateway fills in whatever is missing. |
+| Session semantics | The first 12 hex characters of `x-opencode-session` must be the low 48 bits of an **inverted timestamp** `~(timestamp*0x1000 + counter)`, carrying a small counter.                            |
+
+The first two are handled by the gateway and need no configuration. The third was tightened on **2026-10-13**: the upstream no longer checks the session's **shape** (`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`) alone, it decodes those characters back into a timestamp. Older builds cut them from a sha256 digest — shape-valid, but decoding to no small counter — which made every free model answer 403. Since `v1.3.1`, `CanonicalSessionID` derives the inverted timestamp and small counter straight from the conversation digest, so a session id stays a pure function of its conversation: affinity and prompt-cache behavior are unchanged while the gate is satisfied.
+
+Measured boundary (direct to the upstream, body and headers held constant, only the session varied): counters 1–15 pass and 255 is refused; an ascending (non-inverted) value is refused; **the timestamp itself need not be fresh** — epoch 0, seven days old, and a purely random value all pass.
+
+**Read the status code first**: `403 FreeTierError` is a contract problem (upgrade to `v1.3.1` or later); `429` is a budget problem (see "429 and the daily allowance" in DEPLOYMENT.md).
 
 ### Automatic Xray download
 
