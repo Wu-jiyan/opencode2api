@@ -376,10 +376,17 @@ func ensureAnonymousChatUsage(payload map[string]any, protocol wire.Protocol) bo
 	return true
 }
 
-// ensureAnonymousTools appends minimal definitions for any missing core
-// tool so the request reads as an agent session upstream. It reports
-// whether the payload changed. Tools the client already declared are left
-// untouched.
+// ensureAnonymousTools makes the request read as a genuine agent session: it
+// declares every core tool from the official definitions and reports whether the
+// payload changed.
+//
+// A client's own definition of a core name is dropped rather than kept, because
+// the free tier fingerprints those definitions and one impostor is enough to
+// have the whole request refused — measured 2026-10-14, replacing only `bash`
+// with a minimal definition turned a 200 into a 403. Declaring the official
+// definition instead keeps the request served; the model then calls those tools
+// with the official argument names, which is the shape a real client uses too.
+// Tools outside the core set are passed through untouched.
 func ensureAnonymousTools(payload map[string]any, protocol wire.Protocol) bool {
 	raw, exists := payload["tools"]
 	if !exists {
@@ -390,23 +397,35 @@ func ensureAnonymousTools(payload map[string]any, protocol wire.Protocol) bool {
 	if !ok {
 		return false
 	}
-	present := make(map[string]bool, len(items))
-	for _, item := range items {
-		if name := anonymousToolName(protocol, item); name != "" {
-			present[name] = true
-		}
-	}
-	missing := make([]string, 0, len(anonymousCoreTools))
-	for _, name := range anonymousCoreTools {
-		if !present[name] {
-			missing = append(missing, name)
-		}
-	}
-	if len(missing) == 0 {
+	before, err := json.Marshal(items)
+	if err != nil {
 		return false
 	}
-	payload["tools"] = append(items, anonymousToolset(protocol, missing)...)
+	kept := make([]any, 0, len(items)+len(anonymousCoreTools))
+	for _, item := range items {
+		if isAnonymousCoreTool(anonymousToolName(protocol, item)) {
+			continue
+		}
+		kept = append(kept, item)
+	}
+	kept = append(kept, anonymousToolset(protocol, nil)...)
+	after, err := json.Marshal(kept)
+	if err != nil || string(before) == string(after) {
+		return false
+	}
+	payload["tools"] = kept
 	return true
+}
+
+// isAnonymousCoreTool reports whether a tool name is one of the names the
+// anonymous free tier fingerprints.
+func isAnonymousCoreTool(name string) bool {
+	for _, core := range anonymousCoreTools {
+		if core == name {
+			return true
+		}
+	}
+	return false
 }
 
 func anonymousToolName(protocol wire.Protocol, item any) string {
@@ -431,7 +450,13 @@ func anonymousToolset(protocol wire.Protocol, names []string) []any {
 	return tools
 }
 
+// anonymousTool renders one core tool. The official definition is preferred,
+// because the free tier matches its content; the synthetic shape below is only a
+// fallback for a name the embedded set does not carry.
 func anonymousTool(protocol wire.Protocol, name string) map[string]any {
+	if definition, ok := agentToolDefinition(protocol, name); ok {
+		return definition
+	}
 	description := "Agent tool " + name
 	parameters := map[string]any{"type": "object", "properties": map[string]any{}}
 	switch protocol {

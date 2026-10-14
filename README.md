@@ -362,32 +362,42 @@ The anonymous free tier (`anonymous: true`) has a client-identity gate that is *
 
 **One error message covers several unrelated causes**, so they have to be separated by ablation rather than guessed at. Four requirements are measured, plus one thing that must _not_ be sent:
 
-| Requirement      | Meaning                                                                                                                                                                                                                                              |
-| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Route            | Inference must go to `/inference/v1/*`. Upstream retired `/zen/v1/*`, which answers that same 403 for inference while **the catalog GET `/zen/v1/models` still returns 200** — which is exactly what makes it so misleading.                         |
-| `stream: true`   | Chat requests must stream. The gateway forces this and folds the stream back into JSON for clients that asked for a plain reply.                                                                                                                     |
-| Tool set         | The body must declare OpenCode's tools. `bash` + `read` is the measured minimum; either one alone, or a differently cased name (`Bash`), is refused. The gateway fills in whatever is missing.                                                       |
-| Session counter  | Both `x-opencode-session` and `x-opencode-session-id` must be sent, with their first 12 hex characters equal to the low 48 bits of `~(unixMillis*0x1000 + counter)` where **the counter must be small** (measured: 1 and 5 pass, 255 is refused).    |
-| ⛔ Must not send | **`x-session-affinity`**. A real client only emits that pair on non-opencode provider branches; on the inference route the header alone is enough to turn a 200 into a 403. `X-Session-Id` is tolerated but the real client does not send it either. |
+| Requirement      | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Route            | Inference must go to `/inference/v1/*`. Upstream retired `/zen/v1/*`, which answers that same 403 for inference while **the catalog GET `/zen/v1/models` still returns 200** — which is exactly what makes it so misleading.                                                                                                                                                                                                                   |
+| `stream: true`   | Chat requests must stream. The gateway forces this and folds the stream back into JSON for clients that asked for a plain reply.                                                                                                                                                                                                                                                                                                               |
+| Tool definitions | The body must declare the core tools **with real content**, not just the right names: the description must not be empty and `parameters.properties` must not be empty. `bash` + `read` are the name minimum and five official definitions are enough. **One core tool whose definition does not look official is enough to have the whole request refused.** The gateway therefore declares those five from the embedded official definitions. |
+| Session counter  | Both `x-opencode-session` and `x-opencode-session-id` must be sent, with their first 12 hex characters equal to the low 48 bits of `~(unixMillis*0x1000 + counter)` where **the counter must be small** (measured: 1 and 5 pass, 255 is refused).                                                                                                                                                                                              |
+| ⛔ Must not send | **`x-session-affinity`**. A real client only emits that pair on non-opencode provider branches; on the inference route the header alone is enough to turn a 200 into a 403. `X-Session-Id` is tolerated but the real client does not send it either.                                                                                                                                                                                           |
 
 The gateway applies all of these automatically. The gate was tightened twice:
 
 - **2026-10-13**: it began decoding those 12 hex characters back into a counter and requiring a small one. Implementations that cut the field from a sha256 digest (including this gateway before `v1.3.0`) landed on a small counter only rarely, so every free model answered 403.
-- **2026-10-14**: upstream renamed the anonymous inference route from `/zen` to `/inference`, and `x-session-affinity` became fatal. **This one had nothing to do with session encoding**: replaying a genuine client's captured request byte-for-byte and changing only the route flips 403 to 200.
+- **2026-10-14**: upstream renamed the anonymous inference route from `/zen` to `/inference`, made `x-session-affinity` fatal, and began judging the **content of the tool definitions**. **None of this is about session encoding**: replaying a genuine client's captured request byte-for-byte and changing only the route flips 403 to 200.
 
 Measured boundary (2026-10-14, direct to the upstream, body and headers byte-identical, one variable at a time):
 
-| Variable                                           | Result                                |
-| -------------------------------------------------- | ------------------------------------- |
-| `/zen/v1/chat/completions`                         | `403 FreeTierError`                   |
-| `/inference/v1/chat/completions`                   | `200`, `text/event-stream`            |
-| Correct route + `x-session-affinity`               | `403 FreeTierError`                   |
-| Session's 36-bit timestamp field replaced by noise | `200` (**the timestamp is not read**) |
-| Session mint time back-dated 48 hours              | `200`                                 |
-| Session counter 5                                  | `200`                                 |
-| Session counter 255                                | `403 FreeTierError`                   |
+| Variable                                                     | Result                                       |
+| ------------------------------------------------------------ | -------------------------------------------- |
+| `/zen/v1/chat/completions`                                   | `403 FreeTierError`                          |
+| `/inference/v1/chat/completions`                             | `200`, `text/event-stream`                   |
+| Correct route + `x-session-affinity`                         | `403 FreeTierError`                          |
+| Session's 36-bit timestamp field replaced by noise           | `200` (**the timestamp is not read**)        |
+| Session mint time back-dated 48 hours                        | `200`                                        |
+| Session counter 5 / 255                                      | `200` / `403 FreeTierError`                  |
+| Five official tool definitions                               | `200`                                        |
+| Same five with `properties` emptied                          | `403 FreeTierError`                          |
+| Same five with the descriptions emptied                      | `403 FreeTierError`                          |
+| Same five with `$schema` removed                             | `200` (not checked)                          |
+| Same five with the **parameter** descriptions emptied        | `200` (not checked)                          |
+| Same five with descriptions truncated to 300 chars           | `403 FreeTierError`                          |
+| Same five with filler appended to the descriptions           | `200` (containment, not a hash)              |
+| Eleven official tools, only `bash` made minimal              | `403 FreeTierError` (one impostor is enough) |
+| Official definitions with the host-specific wording replaced | `200`                                        |
 
 From `v1.3.2` the upstream base defaults to `https://opencode.ai/inference`, and **a `/zen` value left in an existing configuration is rewritten to `/inference`** — restricted to that one host and path, so a value naming a proxy or mirror is never touched. The gateway no longer sends `x-session-affinity` or `X-Session-Id`, only the header set the opencode provider itself uses. On the session side it validates the shape and the counter range; `encodeSessionPrefix` still writes a real mint millisecond exactly as the official algorithm does (quantised to the hour, so a conversation keeps one id for an hour), which keeps the encoded time obviously recent should upstream ever start reading it.
+
+From `v1.3.3` the five core tools (`bash`, `edit`, `glob`, `grep`, `read`) are always declared from the **embedded official definitions**. A client's own tool of the same name is replaced rather than forwarded, because one definition that no longer looks official is enough to have the request refused; tools outside the core set (a client's `list_dir`, say) still pass through untouched. The trade-off is that the model sees the official signature for those five names, so the arguments it emits for them follow the official shape too.
 
 **A `403 FreeTierError` must not be retried.** The anonymous lane has exactly one identity (the shared `public` credential plus one client fingerprint), so rotating exits cannot change the verdict. Scanning the whole pool only multiplies it: during the 2026-10-14 outage client latency grew from sub-second to the 12–184s range for a rejection that takes 0.5s to decide. The gateway now **stops** on this response and records `anonymous_identity_rejected`. `429` is accounted per exit address and still rotates.
 
