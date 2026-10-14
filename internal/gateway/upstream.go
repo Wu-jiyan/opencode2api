@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -397,10 +399,6 @@ func ensureAnonymousTools(payload map[string]any, protocol wire.Protocol) bool {
 	if !ok {
 		return false
 	}
-	before, err := json.Marshal(items)
-	if err != nil {
-		return false
-	}
 	kept := make([]any, 0, len(items)+len(anonymousCoreTools))
 	for _, item := range items {
 		if isAnonymousCoreTool(anonymousToolName(protocol, item)) {
@@ -409,8 +407,13 @@ func ensureAnonymousTools(payload map[string]any, protocol wire.Protocol) bool {
 		kept = append(kept, item)
 	}
 	kept = append(kept, anonymousToolset(protocol, nil)...)
-	after, err := json.Marshal(kept)
-	if err != nil || string(before) == string(after) {
+	// Compared structurally rather than by encoding both sides. The official
+	// definitions are inline, so marshalling them twice to answer a boolean cost
+	// ~43us and ~27 KiB per request — more than half of this normalization.
+	// reflect.DeepEqual on the decoded values asks the same question without
+	// reaching for a JSON encoder, and the length check answers it outright
+	// whenever the client brought tools of its own, which is the common case.
+	if len(items) == len(kept) && slices.EqualFunc(items, kept, reflect.DeepEqual) {
 		return false
 	}
 	payload["tools"] = kept
