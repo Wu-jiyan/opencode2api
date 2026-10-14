@@ -200,22 +200,22 @@ Key 初始化时均衡分配到各代理。真实流量会触发代理检查、K
 
 ### Key、监听地址与路由
 
-| 字段                        | 默认值或要求                                                                  |
-| --------------------------- | ----------------------------------------------------------------------------- |
-| `listen`                    | `127.0.0.1:8080`。                                                            |
-| `server_keys`               | 至少一个本地 Key。                                                            |
-| `zen_keys`、`go_keys`       | 未启用匿名模式时，至少需要一个上游 Key。                                      |
-| `anonymous`                 | `false`。                                                                     |
-| `prefer`                    | `go`；可选 `go`、`zen`。                                                      |
-| `upstream.zen`              | `https://opencode.ai/zen`。                                                   |
-| `upstream.go`               | `https://opencode.ai/zen/go`。                                                |
-| `proxies`                   | 两个代理来源都为空时，使用 `["direct"]`。                                     |
-| `proxyfile`                 | 可选；相对路径基于配置文件所在目录解析。                                      |
-| `models.refresh_seconds`    | `300`；最小为 1。                                                             |
-| `models.protocols`          | `{}`；按模型 ID 覆盖原生协议。                                                |
-| `models.strip_free_suffix`  | `false`；对外隐藏模型名末尾的 `-free`。                                       |
-| `reasoning.effort`          | 空（关闭）；可选 `minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`none`。 |
-| `reasoning.effort_by_model` | `{}`；按模型 ID 覆盖 `reasoning.effort`。                                     |
+| 字段                        | 默认值或要求                                                                                                               |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `listen`                    | `127.0.0.1:8080`。                                                                                                         |
+| `server_keys`               | 至少一个本地 Key。                                                                                                         |
+| `zen_keys`、`go_keys`       | 未启用匿名模式时，至少需要一个上游 Key。                                                                                   |
+| `anonymous`                 | `false`。                                                                                                                  |
+| `prefer`                    | `go`；可选 `go`、`zen`。                                                                                                   |
+| `upstream.zen`              | `https://opencode.ai/inference`。旧配置里写死的 `https://opencode.ai/zen` 会被自动改写到该地址（只针对这一个主机与路径）。 |
+| `upstream.go`               | `https://opencode.ai/zen/go`。                                                                                             |
+| `proxies`                   | 两个代理来源都为空时，使用 `["direct"]`。                                                                                  |
+| `proxyfile`                 | 可选；相对路径基于配置文件所在目录解析。                                                                                   |
+| `models.refresh_seconds`    | `300`；最小为 1。                                                                                                          |
+| `models.protocols`          | `{}`；按模型 ID 覆盖原生协议。                                                                                             |
+| `models.strip_free_suffix`  | `false`；对外隐藏模型名末尾的 `-free`。                                                                                    |
+| `reasoning.effort`          | 空（关闭）；可选 `minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`none`。                                              |
+| `reasoning.effort_by_model` | `{}`；按模型 ID 覆盖 `reasoning.effort`。                                                                                  |
 
 ### 强制思考强度
 
@@ -360,19 +360,40 @@ ipv6://2001:db8:1234:5600::1002
 
 #### 免费层的客户端契约（403 的来源）
 
-匿名免费层（`anonymous: true`）除了额度，还有一道**与出口 IP 完全无关的客户端身份门禁**。请求不满足契约时，上游对**所有免费模型、所有出口**一律返回 `403 FreeTierError`（`OpenCode's free tier can only be used from within OpenCode`）。此时加再多源地址、换多少个 `/64` 都没用——它不是限流，而是请求形状被拒。契约共三项：
+匿名免费层（`anonymous: true`）除了额度，还有一道**与出口 IP 完全无关的客户端身份门禁**。请求不满足契约时，上游对**所有免费模型、所有出口**一律返回 `403 FreeTierError`（`OpenCode's free tier can only be used from within OpenCode`）。此时加再多源地址、换多少个 `/64` 都没用——它不是限流，而是请求身份被拒。
 
-| 条件           | 说明                                                                                                                                |
-| -------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `stream: true` | Chat 请求必须走流式。网关自动强制，并把流式结果给非流式客户端折叠回 JSON。                                                          |
-| 工具集         | 请求体必须声明 OpenCode 的工具。`bash` + `read` 是实测下限，`bash` 或 `read` 单独出现、大小写不对（`Bash`）都会被拒。网关自动补齐。 |
-| session 语义   | `x-opencode-session` 的前 12 位 hex 必须是**反转时间戳** `~(timestamp*0x1000 + counter)` 的低 48 位，且 counter 足够小。            |
+**同一段文案对应多个不同的根因**，所以只能逐项消融、不能猜。已实测确认的有四项，外加一条**反向**要求：
 
-前两项由网关自动处理，无需配置。第三项于 **2026-10-13** 收紧：上游不再只校验 session 的**形状**（`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`），还会把它**解码回时间戳**。旧版本用 sha256 摘要切出那 12 位，形状合法但解不出小 counter，于是全部免费模型整体 403。`v1.3.1` 起 `CanonicalSessionID` 直接从会话摘要派生反转时间戳与小 counter，会话 ID 因此仍是会话的纯函数——粘性与 prompt cache 亲和性不变，同时满足门禁。
+| 条件               | 说明                                                                                                                                                                                     |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 路由               | 推理必须发到 `/inference/v1/*`。`/zen/v1/*` 已被上游弃用：它对推理一律返回上面那段 403，**但目录 GET `/zen/v1/models` 仍然返回 200**——这正是它能骗过排查的原因。                         |
+| `stream: true`     | Chat 请求必须走流式。网关自动强制，并把流式结果给非流式客户端折叠回 JSON。                                                                                                               |
+| 工具集             | 请求体必须声明 OpenCode 的工具。`bash` + `read` 是实测下限，`bash` 或 `read` 单独出现、大小写不对（`Bash`）都会被拒。网关自动补齐。                                                      |
+| session 的 counter | `x-opencode-session` 与 `x-opencode-session-id` 都要发，且前 12 位 hex 必须是 `~(毫秒时间戳*0x1000 + counter)` 的低 48 位，**解出的 counter 必须足够小**（实测 1 与 5 通过、255 被拒）。 |
+| ⛔ 不要发          | **`x-session-affinity`**。真客户端只在非 opencode 的 provider 分支上发这一对头；在推理路由上单独带上它，就足以把 200 变成 403。`X-Session-Id` 被容忍，但真客户端也不发。                 |
 
-实测边界（本地直连上游，固定请求体与头部，只改 session）：counter 1–15 通过、255 被拒；升序（未反转）被拒；**时间戳本身不必新鲜**，取 epoch 0、7 天前甚至纯随机值都通过。
+前几项由网关自动处理，无需配置。两次收紧的时间线：
 
-**排查顺序是先看错误码**：`403 FreeTierError` 是契约问题（升级到 `v1.3.1` 及以上即可）；`429` 才是额度问题（见 DEPLOYMENT.md 的「429 与每日额度」）。
+- **2026-10-13**：门禁开始把那 12 位 hex 解码回 counter，并要求它足够小。用 sha256 摘要切出这 12 位的实现（包括 `v1.3.0` 之前的本网关）只有很低的比例恰好解出小 counter，于是整体 403。
+- **2026-10-14**：上游把匿名推理路由从 `/zen` 改名为 `/inference`，同时 `x-session-affinity` 开始致命。**这一次与 session 编码无关**：把真客户端抓到的请求**逐字节**回放，只改路由就能从 403 变 200。
+
+实测边界（2026-10-14，直接连上游，请求体与头部逐字节固定，只改一个变量）：
+
+| 变量                               | 结果                        |
+| ---------------------------------- | --------------------------- |
+| `/zen/v1/chat/completions`         | `403 FreeTierError`         |
+| `/inference/v1/chat/completions`   | `200`，`text/event-stream`  |
+| 正确路由 + `x-session-affinity`    | `403 FreeTierError`         |
+| session 的 36 位时间戳字段换成噪声 | `200`（**上游不读时间戳**） |
+| session 的铸造时刻回溯 48 小时     | `200`                       |
+| session 的 counter 取 5            | `200`                       |
+| session 的 counter 取 255          | `403 FreeTierError`         |
+
+`v1.3.2` 起：上游地址默认 `https://opencode.ai/inference`，并且**旧配置里写死的 `/zen` 会被自动改写到 `/inference`**（只针对 `opencode.ai` 这一个主机与路径，指向代理或镜像的取值不会被碰）。同时不再发送 `x-session-affinity` / `X-Session-Id`，只发 opencode provider 自己那套头。session 侧只校验形状与 counter 范围；`encodeSessionPrefix` 仍按官方算法写入真实铸造毫秒（按小时取整，同一会话一小时内 ID 不变），因此编码出来的时间永远是近期，即使上游将来开始读它也不会出问题。
+
+**`403 FreeTierError` 不能重试。** 匿名层只有一个身份（共享的 `public` 凭证 + 一套客户端指纹），换出口不会改变判定；逐个扫完整条出口池只会让客户端延迟从亚秒级涨到 12–184 秒——2026-10-14 故障期间实测就是这样。网关现在遇到它就**立即停止**扫描出口池，并记为 `anonymous_identity_rejected`。`429` 按出口 IP 记账，仍然继续轮换。
+
+**排查顺序是先看错误码**：`403 FreeTierError` 是契约问题（先升级到最新版本）；`429` 才是额度问题（见 DEPLOYMENT.md 的「429 与每日额度」）。
 
 ### Xray 自动下载
 

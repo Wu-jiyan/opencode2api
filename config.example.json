@@ -34,7 +34,7 @@
     "ready_timeout_seconds": 30
   },
   "upstream": {
-    "zen": "https://opencode.ai/zen",
+    "zen": "https://opencode.ai/inference",
     "go": "https://opencode.ai/zen/go"
   },
   "retry": {

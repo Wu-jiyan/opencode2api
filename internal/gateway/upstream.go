@@ -290,6 +290,14 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			g.logger.Debug("anonymous upstream rejected a non-retryable request", "component", "upstream", "event", "anonymous_attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "status", resp.StatusCode, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds())
 			return resp, nil, attempts
 		}
+		// A free-tier identity rejection is the same kind of verdict, but it
+		// arrives as 403, which the check above deliberately lets rotate for the
+		// authenticated tiers. The anonymous lane has no per-exit credential to
+		// rotate onto, so it can only make the rejection worse.
+		if anonymousRejectionIsDeterministic(resp) {
+			g.logger.Debug("anonymous upstream rejected our client identity; stopping rotation", "component", "upstream", "event", "anonymous_identity_rejected", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "status", resp.StatusCode, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds())
+			return resp, nil, attempts
+		}
 		lastResponse = resp
 		lastErr = err
 		if err != nil {
@@ -672,6 +680,43 @@ func (r *releaseOnClose) Close() error {
 	return err
 }
 
+// peekPrefix reads at most limit bytes from the response and rewrites the body
+// so those same bytes are served again to whoever reads it next. The value stays
+// a *releaseOnClose, which is what keeps attemptTransport able to attribute the
+// response to the exit that served it.
+func (r *releaseOnClose) peekPrefix(limit int64) ([]byte, error) {
+	buffered := make([]byte, limit)
+	n, err := io.ReadFull(r.ReadCloser, buffered)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return nil, err
+	}
+	r.ReadCloser = &replayBody{prefix: buffered[:n], rest: r.ReadCloser}
+	return buffered[:n], nil
+}
+
+// replayBody serves a buffered prefix and then the rest of the original stream,
+// closing the original exactly once.
+type replayBody struct {
+	prefix []byte
+	rest   io.ReadCloser
+	once   sync.Once
+}
+
+func (r *replayBody) Read(p []byte) (int, error) {
+	if len(r.prefix) > 0 {
+		n := copy(p, r.prefix)
+		r.prefix = r.prefix[n:]
+		return n, nil
+	}
+	return r.rest.Read(p)
+}
+
+func (r *replayBody) Close() error {
+	var err error
+	r.once.Do(func() { err = r.rest.Close() })
+	return err
+}
+
 // attemptTransport returns the proxy exit that served a response, if the body
 // still carries the marker the transport attached when the request was sent.
 func attemptTransport(resp *http.Response) *proxyTransport {
@@ -732,12 +777,22 @@ func newUpstreamRequest(ctx context.Context, baseURL string, protocol wire.Proto
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("User-Agent", httpx.UserAgent())
 	req.Header.Set("x-opencode-client", "cli")
+	// Measured against the live gate on 2026-10-14 with an otherwise byte-exact
+	// copy of a genuine client request:
+	//
+	//	x-opencode-session-id dropped     -> 403 FreeTierError
+	//	x-session-affinity added          -> 403 FreeTierError
+	//	X-Session-Id added                -> 200 (tolerated, but not sent by the
+	//	                                     opencode provider branch)
+	//	an unrelated extra header added   -> 200 (so the rule is specific)
+	//
+	// The gateway used to send x-session-affinity and X-Session-Id because the
+	// 1.18.x client emits that pair for other providers. The opencode provider
+	// never does, and on 2026-10-14 the extra affinity header alone was enough
+	// to have every free-tier request refused. Send the provider's own header
+	// set and nothing more.
 	req.Header.Set("x-opencode-session", ids.Session)
-	// OpenCode 1.18.x sends these correlation headers to preserve provider-side
-	// prompt/session affinity. Keep the legacy x-opencode-session header too so
-	// older Zen deployments continue to recognize the request.
-	req.Header.Set("x-session-affinity", ids.Session)
-	req.Header.Set("X-Session-Id", ids.Session)
+	req.Header.Set("x-opencode-session-id", ids.Session)
 	req.Header.Set("x-opencode-request", ids.Request)
 	req.Header.Set("x-opencode-project", ids.Project)
 	if ids.ParentSession != "" {
@@ -755,4 +810,49 @@ func newUpstreamRequest(ctx context.Context, baseURL string, protocol wire.Proto
 
 func isNonRetryableClientResponse(resp *http.Response, err error) bool {
 	return err == nil && resp != nil && resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests
+}
+
+// freeTierRejectionMarker identifies the error upstream returns when it decides
+// a request did not come from the official client.
+const freeTierRejectionMarker = "FreeTierError"
+
+// anonymousRejectionIsDeterministic reports whether a response is a verdict on
+// the request itself rather than on the exit that served it.
+//
+// The anonymous lane has exactly one identity: the shared "public" credential
+// plus one spoofed client fingerprint. A free-tier rejection therefore carries
+// no information about the exit address, and every remaining exit would answer
+// identically. Rotating on one buys a tunnel and a TLS handshake per exit, and
+// upstream counts each rejected request against the caller, so scanning the
+// pool multiplies the very rejections that caused the first one. During the
+// 2026-10-14 outage that turned a sub-second rejection into 12-184s client
+// latencies. Quota exhaustion is a different case: it is accounted per exit
+// address, so 429 must keep rotating.
+func anonymousRejectionIsDeterministic(resp *http.Response) bool {
+	if resp == nil || resp.StatusCode != http.StatusForbidden {
+		return false
+	}
+	body, err := peekResponsePrefix(resp, 4096)
+	if err != nil {
+		return false
+	}
+	return bytes.Contains(body, []byte(freeTierRejectionMarker))
+}
+
+// peekResponsePrefix reads at most limit bytes of a response body and rewrites
+// the response so the same bytes are served again to the next reader.
+func peekResponsePrefix(resp *http.Response, limit int64) ([]byte, error) {
+	if resp == nil || resp.Body == nil {
+		return nil, errors.New("response has no body")
+	}
+	if release, ok := resp.Body.(*releaseOnClose); ok {
+		return release.peekPrefix(limit)
+	}
+	buffered := make([]byte, limit)
+	n, err := io.ReadFull(resp.Body, buffered)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return nil, err
+	}
+	resp.Body = &replayBody{prefix: buffered[:n], rest: resp.Body}
+	return buffered[:n], nil
 }

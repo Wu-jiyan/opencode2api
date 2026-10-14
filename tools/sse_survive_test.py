@@ -148,7 +148,7 @@ def test_one(edge_ip, port, max_time=260):
              "--data-binary", f"@{body_path}",
              "-o", out_path,
              "-w", "%{http_code}",           # 只有完整结束才会真正写出
-             "https://opencode.ai/zen/v1/chat/completions"],
+             "https://opencode.ai/inference/v1/chat/completions"],
             capture_output=True, text=True, timeout=max_time + 30,
         )
         secs = time.perf_counter() - started
@@ -187,7 +187,7 @@ def main():
         return 2
     ips = sys.argv[1:] or DEFAULT_IPS
     print(f"[*] 真实 SSE 长流测试, 每个最多 260s, 并发 {len(ips)}")
-    print(f"[*] 目标: https://opencode.ai/zen/v1/chat/completions via {SNI}\n")
+    print(f"[*] 目标: https://opencode.ai/inference/v1/chat/completions via {SNI}\n")
     print(f"{'edge ip':<19}{'survived':>10}  {'status':<28}")
     print("-" * 60)
     results = []

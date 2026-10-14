@@ -257,7 +257,7 @@ func Load(path string) (Config, error) {
 	}
 	cfg := Config{
 		Listen:      "127.0.0.1:8080",
-		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/zen", Go: "https://opencode.ai/zen/go"},
+		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/inference", Go: "https://opencode.ai/zen/go"},
 		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300},
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
 		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15},
@@ -276,6 +276,27 @@ func Load(path string) (Config, error) {
 		return Config{}, fmt.Errorf("parse %s: %w", path, err)
 	}
 	return Normalize(path, cfg)
+}
+
+// retiredZenPath is the anonymous inference base path opencode.ai answered with
+// 403 FreeTierError after the 2026-10-14 move to /inference.
+const retiredZenPath = "/zen"
+
+// rewriteRetiredZenBase maps that retired opencode.ai base onto its successor.
+// It reports false for every other value so an operator pointing the gateway at
+// a proxy or a mirror keeps full control of the URL.
+func rewriteRetiredZenBase(raw string) (string, bool) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || !strings.EqualFold(u.Hostname(), "opencode.ai") {
+		return raw, false
+	}
+	if strings.TrimRight(u.Path, "/") != retiredZenPath {
+		return raw, false
+	}
+	rewritten := *u
+	rewritten.Path = "/inference"
+	rewritten.RawPath = ""
+	return rewritten.String(), true
 }
 
 // Normalize resolves external inputs and validates a Config supplied by
@@ -302,6 +323,14 @@ func Normalize(path string, cfg Config) (Config, error) {
 		if err != nil || u.Host == "" || (strings.ToLower(u.Scheme) != "http" && strings.ToLower(u.Scheme) != "https") {
 			return Config{}, fmt.Errorf("%s must be an http or https URL", name)
 		}
+	}
+	// Upstream moved the anonymous inference route from /zen to /inference on
+	// 2026-10-14. The retired path still serves the catalog GET but answers
+	// 403 FreeTierError for inference, so a configuration saved before the move
+	// would keep failing after an upgrade. Rewrite only that one host and path:
+	// a value naming a proxy or a mirror is left exactly as the operator set it.
+	if rewritten, ok := rewriteRetiredZenBase(cfg.Upstream.Zen); ok {
+		cfg.Upstream.Zen = rewritten
 	}
 	if len(cfg.ServerKeys) == 0 {
 		return Config{}, errors.New("server_keys must contain at least one local key")

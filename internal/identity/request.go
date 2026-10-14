@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"time"
 
 	"opencode2api/internal/jsonutil"
 )
@@ -23,6 +24,10 @@ type RequestIDs struct {
 }
 
 func DeriveRequestIDs(r *http.Request, body map[string]any) RequestIDs {
+	return deriveRequestIDsAt(r, body, time.Now().UnixMilli())
+}
+
+func deriveRequestIDsAt(r *http.Request, body map[string]any, nowMillis int64) RequestIDs {
 	signal := jsonutil.FirstString(
 		r.Header.Get("x-opencode-session"),
 		r.Header.Get("x-session-affinity"),
@@ -43,7 +48,7 @@ func DeriveRequestIDs(r *http.Request, body map[string]any) RequestIDs {
 	if signal == "" || signal == `{}` {
 		signal = RandomID("fallback", 16)
 	}
-	session := CanonicalSessionID(signal)
+	session := canonicalSessionIDAt(signal, nowMillis)
 	projectSignal := jsonutil.FirstString(r.Header.Get("x-opencode-project"), jsonutil.StringAt(body, "metadata", "project_id"))
 	if projectSignal == "" {
 		projectSignal = "opencode2api:default-project"
@@ -91,27 +96,35 @@ var canonicalSessionPattern = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{1
 const (
 	base62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-	// sessionCounterMax bounds the counter field encoded into the leading hex
-	// characters of a session id.
+	// sessionMintCounter is the counter the gateway writes: 1 is what a real
+	// client emits for the first identifier it mints in a millisecond.
+	sessionMintCounter = 1
+
+	// sessionCounterMax is the largest counter upstream has been measured to
+	// accept. Upstream decodes the 12 leading hex characters as the low 48 bits
+	// of ~(unixMillis*0x1000 + counter) and serves the request only when that
+	// counter is small. Measured against the live gate by varying the session id
+	// alone, everything else byte-identical:
 	//
-	// The Zen free tier does not merely shape-check those characters. Upstream
-	// (packages/schema/src/identifier.ts) builds them as the low 48 bits of
-	// (timestamp*0x1000 + counter), bit-inverted for a session so that newer
-	// ids sort first, and decodes them again to reject ids no real client could
-	// have produced. Measured against the live gate on 2026-10-13 with every
-	// other request property held constant:
+	//	2026-10-13  counter 1 and 15 -> 200    counter 255 -> 403
+	//	2026-10-14  counter 1 and 5  -> 200    counter 255 -> 403
+	//	2026-10-14  the 36-bit timestamp field replaced with noise -> 200
+	//	2026-10-14  mint time back-dated 48 hours -> 200
 	//
-	//	ses_<sha256 cut>          -> 403 FreeTierError
-	//	ses_...(counter 1)        -> 200
-	//	ses_...(counter 15)       -> 200
-	//	ses_...(counter 255)      -> 403 FreeTierError
-	//	ascending (not inverted)  -> 403 FreeTierError
-	//	any timestamp (epoch 0, 7 days old, or random) -> 200
-	//
-	// So the timestamp need only be inverted, while the counter must stay
-	// small. 15 is the largest value measured to be accepted, and it also
-	// reproduces the "ff0".."ffe" tail a real client emits.
+	// So upstream checks the counter and does NOT read the timestamp. Ids whose
+	// counter falls outside this range are re-minted; a real client's ids, which
+	// only ever use a small counter, pass through untouched.
 	sessionCounterMax = 15
+
+	// sessionMintBucket is how coarsely that mint time is quantised. A
+	// conversation keeps one session id for a whole bucket, which is what
+	// preserves upstream prompt-cache affinity and keeps the conversation on one
+	// exit for that hour; quantising also removes any need for a mint cache. The
+	// encoded time stays obviously recent, so it cannot age out of any window
+	// upstream might start enforcing.
+	sessionMintBucket = time.Hour
+
+	sessionMintBucketMillis = int64(sessionMintBucket / time.Millisecond)
 )
 
 // CanonicalSessionID returns signal unchanged when it already carries a session
@@ -119,33 +132,40 @@ const (
 // affinity). Any other downstream identity (UUIDs, foreign client sessions,
 // legacy gateway sessions, conversation seeds) is deterministically encoded
 // into the canonical shape so the same conversation keeps a stable session.
+//
+// Only the trailing 14 characters are a function of signal: they are the
+// digest-derived, per-conversation part. The leading hex characters carry the
+// counter the gate checks, so they come from the mint instant instead.
 func CanonicalSessionID(signal string) string {
+	return canonicalSessionIDAt(signal, time.Now().UnixMilli())
+}
+
+func canonicalSessionIDAt(signal string, nowMillis int64) string {
 	if validCanonicalSessionID(signal) {
 		return signal
 	}
+	mintMillis := nowMillis - nowMillis%sessionMintBucketMillis
 	sum := sha256.Sum256([]byte("ses\x00" + signal))
-	prefix := encodeSessionPrefix(sum[:6])
 	randomPart := base62Fixed(new(big.Int).SetBytes(sum[6:16]), 14)
-	return "ses_" + prefix + randomPart
+	return "ses_" + encodeSessionPrefix(mintMillis) + randomPart
 }
 
-// encodeSessionPrefix renders 48 bits of digest as the 12 leading hex
-// characters upstream decodes as an inverted (timestamp*0x1000 + counter)
-// value. Both fields are taken from the digest, which keeps the id a pure
-// function of the conversation signal while still carrying a counter small
-// enough for the free-tier gate to accept.
-func encodeSessionPrefix(digest []byte) string {
-	value := uint64(digest[0])<<40 | uint64(digest[1])<<32 | uint64(digest[2])<<24 |
-		uint64(digest[3])<<16 | uint64(digest[4])<<8 | uint64(digest[5])
-	timestamp := value & 0xFFFFFFFFF // low 36 bits: the decoded millisecond field
-	counter := 1 + (value>>36)%sessionCounterMax
-	current := timestamp<<12 | counter
+// encodeSessionPrefix renders the 12 leading hex characters of an official
+// OpenCode identifier: the low 48 bits of ~(unixMillis*0x1000 + counter), which
+// is exactly what packages/schema/src/identifier.ts writes for a descending id.
+// That is what makes the low 12 bits decode back to a counter of 1, which is the
+// part upstream verifies.
+func encodeSessionPrefix(unixMillis int64) string {
+	current := uint64(unixMillis)*0x1000 + sessionMintCounter
 	return fmt.Sprintf("%012x", ^current&0xFFFFFFFFFFFF)
 }
 
-// validCanonicalSessionID reports whether an id already matches both the shape
-// and the inverted-timestamp semantics the free tier checks. A shape-only match
-// is not enough: forwarding one makes upstream answer 403 FreeTierError.
+// validCanonicalSessionID reports whether an id may be forwarded untouched.
+// Upstream requires the canonical shape and a counter inside the measured range.
+// A digest-derived implementation (this gateway before v1.3.1, and the upstream
+// plugins that mint sessions the same way) satisfies the shape while landing on
+// a small counter only occasionally, so the shape on its own is not a sufficient
+// test.
 func validCanonicalSessionID(value string) bool {
 	if !canonicalSessionPattern.MatchString(value) {
 		return false

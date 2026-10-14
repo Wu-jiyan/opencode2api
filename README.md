@@ -198,22 +198,22 @@ See [config.example.json](config.example.json) for a complete starting configura
 
 ### Keys, listeners, and routing
 
-| Field                       | Default / requirement                                                       |
-| --------------------------- | --------------------------------------------------------------------------- |
-| `listen`                    | `127.0.0.1:8080`.                                                           |
-| `server_keys`               | At least one local key is required.                                         |
-| `zen_keys`, `go_keys`       | At least one upstream key is required unless anonymous access is enabled.   |
-| `anonymous`                 | `false`.                                                                    |
-| `prefer`                    | `go`; accepts `go` or `zen`.                                                |
-| `upstream.zen`              | `https://opencode.ai/zen`.                                                  |
-| `upstream.go`               | `https://opencode.ai/zen/go`.                                               |
-| `proxies`                   | Falls back to `["direct"]` when both proxy sources are empty.               |
-| `proxyfile`                 | Optional; relative paths resolve beside the configuration file.             |
-| `models.refresh_seconds`    | `300`; minimum 1.                                                           |
-| `models.protocols`          | `{}`; per-model native protocol overrides.                                  |
-| `models.strip_free_suffix`  | `false`; hide a trailing `-free` from advertised model IDs.                 |
-| `reasoning.effort`          | Empty (off); `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `none`. |
-| `reasoning.effort_by_model` | `{}`; per-model overrides of `reasoning.effort`.                            |
+| Field                       | Default / requirement                                                                                           |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `listen`                    | `127.0.0.1:8080`.                                                                                               |
+| `server_keys`               | At least one local key is required.                                                                             |
+| `zen_keys`, `go_keys`       | At least one upstream key is required unless anonymous access is enabled.                                       |
+| `anonymous`                 | `false`.                                                                                                        |
+| `prefer`                    | `go`; accepts `go` or `zen`.                                                                                    |
+| `upstream.zen`              | `https://opencode.ai/inference`. A `/zen` value already saved is rewritten to it (that one host and path only). |
+| `upstream.go`               | `https://opencode.ai/zen/go`.                                                                                   |
+| `proxies`                   | Falls back to `["direct"]` when both proxy sources are empty.                                                   |
+| `proxyfile`                 | Optional; relative paths resolve beside the configuration file.                                                 |
+| `models.refresh_seconds`    | `300`; minimum 1.                                                                                               |
+| `models.protocols`          | `{}`; per-model native protocol overrides.                                                                      |
+| `models.strip_free_suffix`  | `false`; hide a trailing `-free` from advertised model IDs.                                                     |
+| `reasoning.effort`          | Empty (off); `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `none`.                                     |
+| `reasoning.effort_by_model` | `{}`; per-model overrides of `reasoning.effort`.                                                                |
 
 ### Forced thinking level
 
@@ -358,19 +358,40 @@ Both can run together. The transport list is assembled as static `proxies`, then
 
 #### The free tier's client contract (where 403 comes from)
 
-The anonymous free tier (`anonymous: true`) has a client-identity gate that is **completely independent of the exit IP**. When a request does not satisfy the contract, the upstream answers `403 FreeTierError` (`OpenCode's free tier can only be used from within OpenCode`) for **every free model on every exit**. Adding more source addresses or more `/64` blocks does nothing here — this is not throttling, it is the request shape being refused. The contract has three parts:
+The anonymous free tier (`anonymous: true`) has a client-identity gate that is **completely independent of the exit IP**. When a request does not satisfy the contract, the upstream answers `403 FreeTierError` (`OpenCode's free tier can only be used from within OpenCode`) for **every free model on every exit**. Adding more source addresses or more `/64` blocks does nothing here — this is not throttling, it is the request identity being refused.
 
-| Requirement       | Meaning                                                                                                                                                                                        |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `stream: true`    | Chat requests must stream. The gateway forces this and folds the stream back into JSON for clients that asked for a plain reply.                                                               |
-| Tool set          | The body must declare OpenCode's tools. `bash` + `read` is the measured minimum; either one alone, or a differently cased name (`Bash`), is refused. The gateway fills in whatever is missing. |
-| Session semantics | The first 12 hex characters of `x-opencode-session` must be the low 48 bits of an **inverted timestamp** `~(timestamp*0x1000 + counter)`, carrying a small counter.                            |
+**One error message covers several unrelated causes**, so they have to be separated by ablation rather than guessed at. Four requirements are measured, plus one thing that must _not_ be sent:
 
-The first two are handled by the gateway and need no configuration. The third was tightened on **2026-10-13**: the upstream no longer checks the session's **shape** (`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`) alone, it decodes those characters back into a timestamp. Older builds cut them from a sha256 digest — shape-valid, but decoding to no small counter — which made every free model answer 403. Since `v1.3.1`, `CanonicalSessionID` derives the inverted timestamp and small counter straight from the conversation digest, so a session id stays a pure function of its conversation: affinity and prompt-cache behavior are unchanged while the gate is satisfied.
+| Requirement      | Meaning                                                                                                                                                                                                                                              |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Route            | Inference must go to `/inference/v1/*`. Upstream retired `/zen/v1/*`, which answers that same 403 for inference while **the catalog GET `/zen/v1/models` still returns 200** — which is exactly what makes it so misleading.                         |
+| `stream: true`   | Chat requests must stream. The gateway forces this and folds the stream back into JSON for clients that asked for a plain reply.                                                                                                                     |
+| Tool set         | The body must declare OpenCode's tools. `bash` + `read` is the measured minimum; either one alone, or a differently cased name (`Bash`), is refused. The gateway fills in whatever is missing.                                                       |
+| Session counter  | Both `x-opencode-session` and `x-opencode-session-id` must be sent, with their first 12 hex characters equal to the low 48 bits of `~(unixMillis*0x1000 + counter)` where **the counter must be small** (measured: 1 and 5 pass, 255 is refused).    |
+| ⛔ Must not send | **`x-session-affinity`**. A real client only emits that pair on non-opencode provider branches; on the inference route the header alone is enough to turn a 200 into a 403. `X-Session-Id` is tolerated but the real client does not send it either. |
 
-Measured boundary (direct to the upstream, body and headers held constant, only the session varied): counters 1–15 pass and 255 is refused; an ascending (non-inverted) value is refused; **the timestamp itself need not be fresh** — epoch 0, seven days old, and a purely random value all pass.
+The gateway applies all of these automatically. The gate was tightened twice:
 
-**Read the status code first**: `403 FreeTierError` is a contract problem (upgrade to `v1.3.1` or later); `429` is a budget problem (see "429 and the daily allowance" in DEPLOYMENT.md).
+- **2026-10-13**: it began decoding those 12 hex characters back into a counter and requiring a small one. Implementations that cut the field from a sha256 digest (including this gateway before `v1.3.0`) landed on a small counter only rarely, so every free model answered 403.
+- **2026-10-14**: upstream renamed the anonymous inference route from `/zen` to `/inference`, and `x-session-affinity` became fatal. **This one had nothing to do with session encoding**: replaying a genuine client's captured request byte-for-byte and changing only the route flips 403 to 200.
+
+Measured boundary (2026-10-14, direct to the upstream, body and headers byte-identical, one variable at a time):
+
+| Variable                                           | Result                                |
+| -------------------------------------------------- | ------------------------------------- |
+| `/zen/v1/chat/completions`                         | `403 FreeTierError`                   |
+| `/inference/v1/chat/completions`                   | `200`, `text/event-stream`            |
+| Correct route + `x-session-affinity`               | `403 FreeTierError`                   |
+| Session's 36-bit timestamp field replaced by noise | `200` (**the timestamp is not read**) |
+| Session mint time back-dated 48 hours              | `200`                                 |
+| Session counter 5                                  | `200`                                 |
+| Session counter 255                                | `403 FreeTierError`                   |
+
+From `v1.3.2` the upstream base defaults to `https://opencode.ai/inference`, and **a `/zen` value left in an existing configuration is rewritten to `/inference`** — restricted to that one host and path, so a value naming a proxy or mirror is never touched. The gateway no longer sends `x-session-affinity` or `X-Session-Id`, only the header set the opencode provider itself uses. On the session side it validates the shape and the counter range; `encodeSessionPrefix` still writes a real mint millisecond exactly as the official algorithm does (quantised to the hour, so a conversation keeps one id for an hour), which keeps the encoded time obviously recent should upstream ever start reading it.
+
+**A `403 FreeTierError` must not be retried.** The anonymous lane has exactly one identity (the shared `public` credential plus one client fingerprint), so rotating exits cannot change the verdict. Scanning the whole pool only multiplies it: during the 2026-10-14 outage client latency grew from sub-second to the 12–184s range for a rejection that takes 0.5s to decide. The gateway now **stops** on this response and records `anonymous_identity_rejected`. `429` is accounted per exit address and still rotates.
+
+**Read the status code first**: `403 FreeTierError` is a contract problem (upgrade to the latest release first); `429` is a budget problem (see "429 and the daily allowance" in DEPLOYMENT.md).
 
 ### Automatic Xray download
 
