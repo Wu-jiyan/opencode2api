@@ -368,6 +368,7 @@ The anonymous free tier (`anonymous: true`) has a client-identity gate that is *
 | `stream: true`   | Chat requests must stream. The gateway forces this and folds the stream back into JSON for clients that asked for a plain reply.                                                                                                                                                                                                                                                                                                               |
 | Tool definitions | The body must declare the core tools **with real content**, not just the right names: the description must not be empty and `parameters.properties` must not be empty. `bash` + `read` are the name minimum and five official definitions are enough. **One core tool whose definition does not look official is enough to have the whole request refused.** The gateway therefore declares those five from the embedded official definitions. |
 | Session counter  | Both `x-opencode-session` and `x-opencode-session-id` must be sent, with their first 12 hex characters equal to the low 48 bits of `~(unixMillis*0x1000 + counter)` where **the counter must be small** (measured: 1 and 5 pass, 255 is refused).                                                                                                                                                                                              |
+| Client headers   | `User-Agent`, `x-opencode-project` and `x-opencode-request` must each look like the real client's, and **all three must be right at once** (changing only one still answers 403): the UA needs a runtime token after `opencode/<version>` (a bare version is refused); the project is `global` (the gateway no longer synthesises `prj_…`); the request id must be `msg_` plus a canonically shaped identifier (no more `req_…`).              |
 | ⛔ Must not send | **`x-session-affinity`**. A real client only emits that pair on non-opencode provider branches; on the inference route the header alone is enough to turn a 200 into a 403. `X-Session-Id` is tolerated but the real client does not send it either.                                                                                                                                                                                           |
 
 The gateway applies all of these automatically. The gate was tightened twice:
@@ -377,27 +378,37 @@ The gateway applies all of these automatically. The gate was tightened twice:
 
 Measured boundary (2026-10-14, direct to the upstream, body and headers byte-identical, one variable at a time):
 
-| Variable                                                     | Result                                       |
-| ------------------------------------------------------------ | -------------------------------------------- |
-| `/zen/v1/chat/completions`                                   | `403 FreeTierError`                          |
-| `/inference/v1/chat/completions`                             | `200`, `text/event-stream`                   |
-| Correct route + `x-session-affinity`                         | `403 FreeTierError`                          |
-| Session's 36-bit timestamp field replaced by noise           | `200` (**the timestamp is not read**)        |
-| Session mint time back-dated 48 hours                        | `200`                                        |
-| Session counter 5 / 255                                      | `200` / `403 FreeTierError`                  |
-| Five official tool definitions                               | `200`                                        |
-| Same five with `properties` emptied                          | `403 FreeTierError`                          |
-| Same five with the descriptions emptied                      | `403 FreeTierError`                          |
-| Same five with `$schema` removed                             | `200` (not checked)                          |
-| Same five with the **parameter** descriptions emptied        | `200` (not checked)                          |
-| Same five with descriptions truncated to 300 chars           | `403 FreeTierError`                          |
-| Same five with filler appended to the descriptions           | `200` (containment, not a hash)              |
-| Eleven official tools, only `bash` made minimal              | `403 FreeTierError` (one impostor is enough) |
-| Official definitions with the host-specific wording replaced | `200`                                        |
+| Variable                                                                               | Result                                                                      |
+| -------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `/zen/v1/chat/completions`                                                             | `403 FreeTierError`                                                         |
+| `/inference/v1/chat/completions`                                                       | `200`, `text/event-stream`                                                  |
+| Correct route + `x-session-affinity`                                                   | `403 FreeTierError`                                                         |
+| Session's 36-bit timestamp field replaced by noise                                     | `200` (**the timestamp is not read**)                                       |
+| Session mint time back-dated 48 hours                                                  | `200`                                                                       |
+| Session counter 5 / 255                                                                | `200` / `403 FreeTierError`                                                 |
+| Five official tool definitions                                                         | `200`                                                                       |
+| Same five with `properties` emptied                                                    | `403 FreeTierError`                                                         |
+| Same five with the descriptions emptied                                                | `403 FreeTierError`                                                         |
+| Same five with `$schema` removed                                                       | `200` (not checked)                                                         |
+| Same five with the **parameter** descriptions emptied                                  | `200` (not checked)                                                         |
+| Same five with descriptions truncated to 300 chars                                     | `403 FreeTierError`                                                         |
+| Same five with filler appended to the descriptions                                     | `200` (containment, not a hash)                                             |
+| Eleven official tools, only `bash` made minimal                                        | `403 FreeTierError` (one impostor is enough)                                |
+| Official definitions with the host-specific wording replaced                           | `200`                                                                       |
+| UA `opencode/1.18.31 (linux amd64; go1.24.13)`                                         | `403 FreeTierError` (the only refused UA; it carried the Go runtime marker) |
+| UA `opencode/1.19.0 (linux; x64)`, `opencode/1.19.0 linux`, `opencode/1.19.0 ai-sdk/…` | `200`                                                                       |
+| `x-opencode-project` = `prj_<24 hex>`                                                  | `403 FreeTierError`                                                         |
+| `x-opencode-project` = `global`, an arbitrary word, `my_project`, 32 hex               | `200`                                                                       |
+| `x-opencode-request` = `req_<32 hex>`, `msg_`+anything, bare `msg_`                    | `403 FreeTierError`                                                         |
+| `x-opencode-request` = `msg_` + 12 hex + 14 base62                                     | `200` (the encoding's content is not checked)                               |
+| `Accept` = `application/json, text/event-stream`                                       | `200` (not checked)                                                         |
+| UA / project / request with only one of them changed                                   | `403 FreeTierError` (all three must hold)                                   |
 
 From `v1.3.2` the upstream base defaults to `https://opencode.ai/inference`, and **a `/zen` value left in an existing configuration is rewritten to `/inference`** — restricted to that one host and path, so a value naming a proxy or mirror is never touched. The gateway no longer sends `x-session-affinity` or `X-Session-Id`, only the header set the opencode provider itself uses. On the session side it validates the shape and the counter range; `encodeSessionPrefix` still writes a real mint millisecond exactly as the official algorithm does (quantised to the hour, so a conversation keeps one id for an hour), which keeps the encoded time obviously recent should upstream ever start reading it.
 
 From `v1.3.3` the five core tools (`bash`, `edit`, `glob`, `grep`, `read`) are always declared from the **embedded official definitions**. A client's own tool of the same name is replaced rather than forwarded, because one definition that no longer looks official is enough to have the request refused; tools outside the core set (a client's `list_dir`, say) still pass through untouched. The trade-off is that the model sees the official signature for those five names, so the arguments it emits for them follow the official shape too.
+
+From `v1.3.4` the `User-Agent` is the real client's string (`opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14`) instead of one assembled from the Go runtime — the old form, `opencode/1.18.31 (linux amd64; go1.24.13)`, was the only UA measured to be refused, and the `go1.…` marker is almost certainly why. `x-opencode-project` now defaults to `global` (a client's own value passes through) instead of a synthesised `prj_…`, and `x-opencode-request` is a `msg_` plus ascending identifier rather than `req_…`. All three are needed together: fixing any one alone still answers 403.
 
 **A `403 FreeTierError` must not be retried.** The anonymous lane has exactly one identity (the shared `public` credential plus one client fingerprint), so rotating exits cannot change the verdict. Scanning the whole pool only multiplies it: during the 2026-10-14 outage client latency grew from sub-second to the 12–184s range for a rejection that takes 0.5s to decide. The gateway now **stops** on this response and records `anonymous_identity_rejected`. `429` is accounted per exit address and still rotates.
 

@@ -49,9 +49,14 @@ func deriveRequestIDsAt(r *http.Request, body map[string]any, nowMillis int64) R
 		signal = RandomID("fallback", 16)
 	}
 	session := canonicalSessionIDAt(signal, nowMillis)
-	projectSignal := jsonutil.FirstString(r.Header.Get("x-opencode-project"), jsonutil.StringAt(body, "metadata", "project_id"))
-	if projectSignal == "" {
-		projectSignal = "opencode2api:default-project"
+	// The project header is passed through rather than hashed into a gateway-made
+	// id: measured 2026-10-14, the upstream refuses the "prj_<hex>" form this
+	// gateway used to synthesise while it serves "global" (what a real client
+	// sends when no project scopes the session) and any other value a client
+	// supplies.
+	project := jsonutil.FirstString(r.Header.Get("x-opencode-project"), jsonutil.StringAt(body, "metadata", "project_id"))
+	if project == "" {
+		project = defaultProjectID
 	}
 	parentSession := jsonutil.FirstString(
 		r.Header.Get("x-parent-session-id"),
@@ -59,8 +64,8 @@ func deriveRequestIDsAt(r *http.Request, body map[string]any, nowMillis int64) R
 	)
 	return RequestIDs{
 		Session:       session,
-		Request:       RandomID("req", 16),
-		Project:       StableID("prj", projectSignal),
+		Request:       MessageID(nowMillis),
+		Project:       project,
 		ParentSession: parentSession,
 	}
 }
@@ -84,9 +89,35 @@ func conversationSeed(body map[string]any) string {
 	return ""
 }
 
-func StableID(prefix, value string) string {
-	sum := sha256.Sum256([]byte(prefix + "\x00" + value))
-	return prefix + "_" + hex.EncodeToString(sum[:12])
+// defaultProjectID is what a real client sends when no project scopes the
+// session, and the one value measured to be served unconditionally.
+const defaultProjectID = "global"
+
+// MessageID returns a request identifier in the shape the upstream expects:
+// "msg_" + the ascending encoding of the current millisecond + 14 Base62
+// characters. Measured 2026-10-14, with everything else byte-identical:
+//
+//	msg_<12 hex><14 base62>   -> 200, whatever the hex decodes to
+//	req_<32 hex>              -> 403 FreeTierError
+//	msg_<arbitrary text>      -> 403 FreeTierError
+//	msg_                      -> 403 FreeTierError
+//
+// So the identifier has to be canonically shaped; the timestamp inside it is not
+// checked, which is why the ascending encoding of the moment is enough.
+func MessageID(unixMillis int64) string {
+	buf := make([]byte, 10)
+	if _, err := rand.Read(buf); err != nil {
+		panic(fmt.Sprintf("crypto/rand failed: %v", err))
+	}
+	return "msg_" + ascendingPrefix(unixMillis) + base62Fixed(new(big.Int).SetBytes(buf), 14)
+}
+
+// ascendingPrefix renders the 12 leading hex characters of an ascending
+// identifier: the low 48 bits of unixMillis*0x1000 + counter, written forward
+// rather than bit-inverted (a session id uses the inverted form).
+func ascendingPrefix(unixMillis int64) string {
+	current := uint64(unixMillis)*0x1000 + sessionMintCounter
+	return fmt.Sprintf("%012x", current&0xFFFFFFFFFFFF)
 }
 
 // canonicalSessionPattern matches OpenCode's canonical session shape:
