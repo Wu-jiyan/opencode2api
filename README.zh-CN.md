@@ -159,6 +159,8 @@ curl http://localhost:8080/v1/messages \
 
 协议值仅允许 `chat`、`responses`、`anthropic`、`systemone`。原生协议不受支持的模型会从模型列表中隐藏，除非配置了覆盖值。
 
+协议有两个来源：机器可读的 provider 目录（`models.opencode.ai/api.json`，按每个模型的 SDK 推断），以及上游文档里的**端点表**。端点表是 **systemone 路由唯一的声明处**——这类模型在 provider 目录里继承的是默认 SDK，所以端点表读不到就会失去协议、被当成 chat 广告出去，上游随后以 `400 ModelProtocolUnsupported` 拒绝（实测 `jev-1.13-free` 在 chat / responses / messages 下都被拒，而在 `/inference/v1/systemone` 下返回 200）。端点表曾经搬过一次家（`packages/web/src/content/docs/zen.mdx` → `services/www/src/docs/content/console/models.mdx`），旧地址 404 是静默的；`v1.3.5` 起读不到会记 `protocol_docs_unavailable`，别再把它当成上游故障。
+
 `models.strip_free_suffix` 用于隐藏对外模型名末尾的 `-free`：`/v1/models` 返回 `deepseek-v4-flash` 而不是 `deepseek-v4-flash-free`。两种写法都仍可调用 —— 精确匹配目录条目优先，匹配不到才回退到 `名字 + "-free"` —— 因此该开关的取值不会破坏任何已有客户端。上游始终收到真实模型 ID；若去掉后缀后会与目录中已有模型重名，则保留原样以免遮蔽。该开关只影响对外暴露的名字，响应体中回显的 `model` 仍是上游真实 ID。
 
 成本与弃用信息来自 [models.dev](https://models.dev/api.json)，每 24 小时刷新一次，元数据请求超时 30 秒。刷新失败时保留已有数据。

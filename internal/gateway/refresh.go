@@ -351,6 +351,16 @@ func (g *Gateway) RefreshModels(ctx context.Context) {
 	if capabilitiesErr != nil {
 		g.logger.Warn("OpenCode capability catalog refresh failed", "component", "models", "event", "capability_refresh_failed", "error", capabilitiesErr)
 	}
+	// The endpoint tables are fetched from a separate host and are the only source
+	// for a System One route. When one cannot be read the models declared only
+	// there keep no protocol and get advertised as chat models the upstream
+	// refuses, so say so rather than letting it look like an upstream fault.
+	for _, tier := range []config.Tier{config.TierZen, config.TierGo} {
+		if err := capabilities.DocsError[tier]; err != nil {
+			g.logger.Warn("OpenCode endpoint table unavailable; models declared only there keep no protocol",
+				"component", "models", "event", "protocol_docs_unavailable", "tier", tier, "error", err)
+		}
+	}
 	if zen != nil || goModels != nil {
 		capabilities.ApplyDocs()
 		g.catalog.ReplaceWithCapabilities(zen, goModels, capabilities.Protocols, capabilities.Unsupported, capabilities.Metadata, capabilities.Docs)

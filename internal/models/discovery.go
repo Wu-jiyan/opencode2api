@@ -18,8 +18,17 @@ import (
 
 const (
 	CapabilitiesURL = "https://models.opencode.ai/api.json"
-	ZenDocsURL      = "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/zen.mdx"
-	GoDocsURL       = "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/go.mdx"
+	// The endpoint tables live in the console documentation. They are the only
+	// source that declares a System One route: for those models the machine
+	// catalog inherits a provider-wide default SDK, so without this table they
+	// are advertised as chat models that the upstream then refuses with
+	// ModelProtocolUnsupported (measured 2026-10-14: jev-1.13-free answers 400 on
+	// chat, responses and messages, and 200 on systemone). These paths have moved
+	// once already — packages/web/src/content/docs/{zen,go}.mdx became
+	// services/www/src/docs/content/console/{models,go}.mdx — and a 404 there is
+	// silent by nature, so the fetch failure is now reported instead of dropped.
+	ZenDocsURL = "https://raw.githubusercontent.com/anomalyco/opencode/dev/services/www/src/docs/content/console/models.mdx"
+	GoDocsURL  = "https://raw.githubusercontent.com/anomalyco/opencode/dev/services/www/src/docs/content/console/go.mdx"
 )
 
 var protocolDocEndpointPattern = regexp.MustCompile("\\|[^|]+\\|\\s*`?([^|`\\s]+)`?\\s*\\|\\s*`[^`]+/v1/(chat/completions|responses|messages|systemone)`")
@@ -34,6 +43,11 @@ type Capabilities struct {
 	// that one fetch must be retryable on its own instead of taking the whole
 	// capability refresh down with it.
 	Docs map[config.Tier]map[string]wire.Protocol
+	// DocsError records why a tier's endpoint table could not be read. It is kept
+	// rather than swallowed because that table is the only place a System One
+	// route is declared, and a moved document would otherwise cost those models
+	// their protocol with nothing in the logs to say so.
+	DocsError map[config.Tier]error
 }
 
 type capabilityProvider struct {
@@ -133,6 +147,7 @@ func FetchCapabilities(ctx context.Context, client *http.Client, endpoint string
 		Unsupported: map[config.Tier]map[string]bool{config.TierZen: {}, config.TierGo: {}},
 		Metadata:    map[config.Tier]map[string]Metadata{config.TierZen: {}, config.TierGo: {}},
 		Docs:        map[config.Tier]map[string]wire.Protocol{config.TierZen: {}, config.TierGo: {}},
+		DocsError:   map[config.Tier]error{},
 	}
 	var docMu sync.Mutex
 	var docWG sync.WaitGroup
@@ -179,6 +194,9 @@ func FetchCapabilities(ctx context.Context, client *http.Client, endpoint string
 			defer docWG.Done()
 			protocols, err := FetchProtocolDocs(ctx, client, url)
 			if err != nil {
+				docMu.Lock()
+				result.DocsError[tier] = err
+				docMu.Unlock()
 				return
 			}
 			docMu.Lock()
@@ -206,7 +224,7 @@ func FetchProtocolDocs(ctx context.Context, client *http.Client, endpoint string
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("OpenCode endpoint documentation returned HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("OpenCode endpoint documentation at %s returned HTTP %d", endpoint, resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
@@ -238,7 +256,7 @@ func FetchProtocolDocs(ctx context.Context, client *http.Client, endpoint string
 		}
 	}
 	if len(result) == 0 {
-		return nil, errors.New("OpenCode endpoint documentation returned no protocol rows")
+		return nil, fmt.Errorf("OpenCode endpoint documentation at %s returned no protocol rows", endpoint)
 	}
 	return result, nil
 }
