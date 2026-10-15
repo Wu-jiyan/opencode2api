@@ -14,6 +14,7 @@ import (
 	"opencode2api/internal/identity"
 	"opencode2api/internal/models"
 	wire "opencode2api/internal/protocol"
+	"opencode2api/internal/telemetry"
 )
 
 // While every exit is cooling there is nothing left to try, so the request must
@@ -72,11 +73,25 @@ func TestAnonymousLaneAnswersFromRecordWhileEveryExitCools(t *testing.T) {
 
 	// The next request finds nothing to try and answers immediately, without
 	// reaching upstream, keeping the status and the retry window.
-	second, err, attempts := gateway.doAnonymousUpstream(context.Background(), route, bodies, ids, 0)
+	ctx := telemetry.WithRequestMeta(context.Background(), &telemetry.RequestMeta{})
+	second, err, attempts := gateway.doAnonymousUpstream(ctx, route, bodies, ids, 0)
 	if err != nil {
 		t.Fatalf("replayed anonymous attempt failed: %v", err)
 	}
 	defer func() { _ = second.Body.Close() }()
+	// An answered request must still be attributable, or an outage would look
+	// like a gateway that received nothing: the access log only logs requests
+	// that carry a channel.
+	meta := telemetry.MetaFromContext(ctx)
+	if meta.Channel != "anonymous" || meta.KeyID != "anonymous" || !meta.Anonymous {
+		t.Fatalf("replayed request credential = %q/%q anon=%v, want the anonymous lane's", meta.Channel, meta.KeyID, meta.Anonymous)
+	}
+	if meta.Tier != string(config.TierZen) {
+		t.Fatalf("replayed tier = %q, want %q", meta.Tier, config.TierZen)
+	}
+	if meta.Attempts != 0 {
+		t.Fatalf("replayed attempts = %d, want 0: answering from the record contacts no upstream", meta.Attempts)
+	}
 	if attempts != 0 {
 		t.Fatalf("replayed attempt count = %d, want no upstream attempt", attempts)
 	}

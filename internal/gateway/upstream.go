@@ -255,6 +255,14 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			// and retry window the probe would have returned.
 			if attempts == 0 {
 				if refusal, ok := g.anonymous.Refusal(now); ok && g.anonymous.FullyCooling(now) {
+					// Answering from the record is still an anonymous-lane
+					// answer, so the request has to carry the lane's credential
+					// the same way a probed one does. Without this the access
+					// log stays silent (it only logs requests that have a
+					// channel), and an outage would look like a gateway that
+					// received nothing at all. Attempts stays zero: none were
+					// made.
+					setRequestCredential(ctx, config.TierZen, "anonymous", "anonymous", true, nil)
 					g.logger.Debug("answering from the anonymous lane's recorded refusal", "component", "upstream", "event", "anonymous_refusal_replayed", "request_id", ids.Request, "status", refusal.status, "retry_after", refusal.retryAfter, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true)
 					return refusalResponse(refusal), nil, attempts
 				}
