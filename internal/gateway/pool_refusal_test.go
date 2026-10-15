@@ -2,7 +2,9 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"io"
+	"log/slog"
 	"net/http"
 	"testing"
 	"time"
@@ -77,9 +79,12 @@ func TestAnonymousRefusalWithoutRetryAfterUsesPoolCooldown(t *testing.T) {
 	}
 }
 
-// An exit that just served us proves the lane-level refusal no longer describes
-// upstream; keeping it would refuse traffic that upstream is willing to serve.
-func TestAnonymousRefusalClearedByServedRequest(t *testing.T) {
+// The record is retired by a served inference request and by nothing else. The
+// catalog refresh must not retire it: that route answers 200 while inference is
+// rate-limited, so clearing on it would send the next request back to probing an
+// upstream that is still refusing — every five minutes, for as long as the
+// window lasts.
+func TestAnonymousRefusalRetiredOnlyByServedRequest(t *testing.T) {
 	pool := newTestAnonymousPool(t, []string{"http://127.0.0.1:1", "http://127.0.0.1:2"})
 	start := time.Now()
 	pool.RecordRefusal(start, http.StatusTooManyRequests, "3294", []byte(rateLimitBody))
@@ -94,11 +99,20 @@ func TestAnonymousRefusalClearedByServedRequest(t *testing.T) {
 	}
 
 	pool.MarkSuccess(pool.nodes[0])
-	if _, ok := pool.Refusal(start); ok {
-		t.Fatal("a served request must clear the recorded refusal")
+	if _, ok := pool.Refusal(start); !ok {
+		t.Fatal("a catalog refresh that happens to answer 200 must not clear the refusal record")
 	}
-	if pool.FullyCooling(start) {
-		t.Fatal("a served exit is no longer cooling")
+
+	gateway := &Gateway{
+		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		anonymous: pool,
+	}
+	gateway.observeAnonymousResult(context.Background(), pool.nodes[0], &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       http.NoBody,
+	}, nil)
+	if _, ok := pool.Refusal(start); ok {
+		t.Fatal("a served inference request must clear the recorded refusal")
 	}
 }
 

@@ -698,9 +698,16 @@ func (g *Gateway) observeAnonymousResult(ctx context.Context, node *anonymousNod
 	g.syncProxyResult(ctx, node.proxy, status, err)
 	if err == nil && status/100 == 2 {
 		g.anonymous.MarkSuccess(node)
-	} else {
-		g.anonymous.MarkFailure(node, resp, err)
+		// A served inference request is the outcome that proves a lane-level
+		// refusal no longer describes upstream, so it is also what retires the
+		// record. The catalog refresh deliberately does not: that route answers
+		// 200 while inference is rate-limited — the same trap that made a
+		// retired inference path look alive — so clearing on it would send the
+		// next request back to probing an upstream that is still refusing.
+		g.anonymous.ClearRefusal()
+		return
 	}
+	g.anonymous.MarkFailure(node, resp, err)
 }
 
 func upstreamStatus(resp *http.Response) int {

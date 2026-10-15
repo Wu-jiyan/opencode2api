@@ -198,9 +198,6 @@ func (p *anonymousPool) MarkSuccess(node *anonymousNode) {
 	}
 	node.failures.Store(0)
 	node.cooldownUntil.Store(0)
-	// An exit that just served us proves the lane-level refusal no longer
-	// describes upstream, so it must not outlive the condition it recorded.
-	p.ClearRefusal()
 }
 
 // RecordRefusal keeps a lane-level refusal and reports whether the record

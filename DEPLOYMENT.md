@@ -589,7 +589,8 @@ curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $SERVER_KEY" 
 
 - `anonymous_lane_refused`：学到窗口时记一次，带 `status` / `retry_after` / `proxy`；
 - `anonymous_refusal_replayed`：每次由记录作答记一次（`Debug` 级，默认 `info` 下不可见）；
-- 只要有任意出口被正常服务，记录立即清除；否则它在上游给出的时刻自然过期。**恢复不需要任何人工干预**，但要等 UTC 零点。
+- 记录只由**被正常服务的推理请求**清除，**目录刷新成功不算**：目录路由在推理被限流时照样返回 200，若让它清除记录，每 5 分钟一次的目录刷新都会把记录清掉，让下一个请求再去探一次；
+- 否则它在上游给出的时刻自然过期。**恢复不需要任何人工干预**，但要等 UTC 零点。
 
 自检方式：
 
