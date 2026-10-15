@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -228,6 +229,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	// original bodies.
 	body = prepareAnonymousBody(body, route.ProtocolFor(config.TierZen))
 	for attempts < limit {
+		now := time.Now()
 		if ctx.Err() != nil {
 			// The request-level budget is already gone. Stop scanning instead
 			// of firing attempts that cannot succeed and then recording them
@@ -244,7 +246,18 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			// upstream, which also means no outcome is produced that could
 			// clear the very state blocking the attempt. Fall back to the
 			// unvetted list so real traffic can restore the pool.
+			//
+			// A recorded lane refusal is the exception, and the reason the
+			// record exists: when every exit is cooling because upstream
+			// refused the lane itself, the fallback probe can only collect the
+			// same refusal again, once per request, for as long as the window
+			// lasts. Answering from the record returns the same status, message
+			// and retry window the probe would have returned.
 			if attempts == 0 {
+				if refusal, ok := g.anonymous.Refusal(now); ok && g.anonymous.FullyCooling(now) {
+					g.logger.Debug("answering from the anonymous lane's recorded refusal", "component", "upstream", "event", "anonymous_refusal_replayed", "request_id", ids.Request, "status", refusal.status, "retry_after", refusal.retryAfter, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true)
+					return refusalResponse(refusal), nil, attempts
+				}
 				node = cursor.NextUnvetted()
 			}
 			if node == nil {
@@ -288,6 +301,12 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		// and TLS handshake per remaining proxy before the client is told the
 		// same thing. This mirrors the rule the authenticated lane already
 		// applies; auth, throttling and server failures still rotate.
+		refusal, laneRefusal := anonymousLaneRefusal(resp)
+		if laneRefusal {
+			if recorded := g.anonymous.RecordRefusal(now, refusal.status, refusal.retryAfter, refusal.body); recorded {
+				g.logger.Warn("anonymous lane refused by upstream", "component", "upstream", "event", "anonymous_lane_refused", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "status", refusal.status, "retry_after", refusal.retryAfter, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds())
+			}
+		}
 		if isNonRetryableClientResponse(resp, err) {
 			g.logger.Debug("anonymous upstream rejected a non-retryable request", "component", "upstream", "event", "anonymous_attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "status", resp.StatusCode, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds())
 			return resp, nil, attempts
@@ -296,7 +315,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		// arrives as 403, which the check above deliberately lets rotate for the
 		// authenticated tiers. The anonymous lane has no per-exit credential to
 		// rotate onto, so it can only make the rejection worse.
-		if anonymousRejectionIsDeterministic(resp) {
+		if laneRefusal && refusal.status == http.StatusForbidden {
 			g.logger.Debug("anonymous upstream rejected our client identity; stopping rotation", "component", "upstream", "event", "anonymous_identity_rejected", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "status", resp.StatusCode, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds())
 			return resp, nil, attempts
 		}
@@ -844,27 +863,59 @@ func isNonRetryableClientResponse(resp *http.Response, err error) bool {
 // a request did not come from the official client.
 const freeTierRejectionMarker = "FreeTierError"
 
-// anonymousRejectionIsDeterministic reports whether a response is a verdict on
-// the request itself rather than on the exit that served it.
+// anonymousLaneRefusal reports whether a response is a verdict on the anonymous
+// lane itself rather than on the request or on the exit that served it, and
+// returns the answer worth keeping.
 //
-// The anonymous lane has exactly one identity: the shared "public" credential
-// plus one spoofed client fingerprint. A free-tier rejection therefore carries
-// no information about the exit address, and every remaining exit would answer
-// identically. Rotating on one buys a tunnel and a TLS handshake per exit, and
-// upstream counts each rejected request against the caller, so scanning the
-// pool multiplies the very rejections that caused the first one. During the
-// 2026-10-14 outage that turned a sub-second rejection into 12-184s client
-// latencies. Quota exhaustion is a different case: it is accounted per exit
-// address, so 429 must keep rotating.
-func anonymousRejectionIsDeterministic(resp *http.Response) bool {
-	if resp == nil || resp.StatusCode != http.StatusForbidden {
-		return false
+// Two answers qualify. A free-tier identity rejection says the lane's client
+// fingerprint was refused; a rate limit says the lane's address block is out of
+// allowance. Neither is about the exit: the lane has exactly one identity, the
+// shared "public" credential plus one spoofed client fingerprint, so every
+// remaining exit would answer identically. Rotating on one buys a tunnel and a
+// TLS handshake per exit, and upstream counts each rejected request against the
+// caller, so scanning the pool multiplies the very rejections that caused the
+// first one. During the 2026-10-14 outage that turned a sub-second rejection
+// into 12-184s client latencies.
+//
+// A request-shape rejection (400 and friends) is deliberately not recorded: it
+// is a statement about the request body, so replaying it would answer a later
+// request with an error that was never about it.
+func anonymousLaneRefusal(resp *http.Response) (anonymousRefusal, bool) {
+	if resp == nil {
+		return anonymousRefusal{}, false
 	}
-	body, err := peekResponsePrefix(resp, 4096)
-	if err != nil {
-		return false
+	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests {
+		return anonymousRefusal{}, false
 	}
-	return bytes.Contains(body, []byte(freeTierRejectionMarker))
+	body, err := peekResponsePrefix(resp, anonymousRefusalBodyLimit)
+	if resp.StatusCode == http.StatusForbidden {
+		if err != nil || !bytes.Contains(body, []byte(freeTierRejectionMarker)) {
+			return anonymousRefusal{}, false
+		}
+	} else if err != nil {
+		body = nil
+	}
+	return anonymousRefusal{
+		status:     resp.StatusCode,
+		retryAfter: resp.Header.Get("Retry-After"),
+		body:       body,
+	}, true
+}
+
+// refusalResponse rebuilds a recorded lane refusal so a request that never
+// reached an upstream is answered exactly as one that did.
+func refusalResponse(refusal anonymousRefusal) *http.Response {
+	header := make(http.Header, 2)
+	header.Set("Content-Type", "application/json")
+	if refusal.retryAfter != "" {
+		header.Set("Retry-After", refusal.retryAfter)
+	}
+	return &http.Response{
+		StatusCode: refusal.status,
+		Status:     strconv.Itoa(refusal.status) + " " + http.StatusText(refusal.status),
+		Header:     header,
+		Body:       io.NopCloser(bytes.NewReader(refusal.body)),
+	}
 }
 
 // peekResponsePrefix reads at most limit bytes of a response body and rewrites

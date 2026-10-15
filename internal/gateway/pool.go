@@ -79,6 +79,11 @@ type anonymousPool struct {
 	nodes    []*anonymousNode
 	next     atomic.Uint64
 	cooldown time.Duration
+	// refusalMu guards refusal, the lane-level verdict kept while every exit is
+	// cooling so later requests can be answered without probing an upstream that
+	// has already spoken about the lane rather than about one exit.
+	refusalMu sync.Mutex
+	refusal   *anonymousRefusal
 }
 
 type anonymousNode struct {
@@ -86,6 +91,29 @@ type anonymousNode struct {
 	failures      atomic.Uint32
 	cooldownUntil atomic.Int64
 }
+
+// anonymousRefusal is the last lane-level refusal an exit reported: a rate limit
+// or a free-tier identity rejection. Both describe the lane's single credential
+// and its address block rather than the exit that happened to deliver them, so
+// the answer can be replayed for a later request while every exit is cooling.
+//
+// The scope is measured, not assumed. On 2026-10-15 the free tier refused all
+// 256 addresses of the /56 with Retry-After counting down to the same 00:00 UTC
+// instant; an address the pool had never used, in the same /64 as a refused
+// exit, was refused on the same schedule and so was every other /64, while a
+// Cloudflare WARP egress holding the same "public" credential was served
+// normally. Rotating the project header changed nothing either. The verdict
+// follows the client address block, so no exit can escape it.
+type anonymousRefusal struct {
+	status     int
+	retryAfter string
+	body       []byte
+	deadline   time.Time
+}
+
+// anonymousRefusalBodyLimit bounds how much of a refusal is kept. Enough for the
+// JSON error document, small enough that the record costs nothing.
+const anonymousRefusalBodyLimit = 4096
 
 type anonymousCursor struct {
 	pool   *anonymousPool
@@ -170,6 +198,84 @@ func (p *anonymousPool) MarkSuccess(node *anonymousNode) {
 	}
 	node.failures.Store(0)
 	node.cooldownUntil.Store(0)
+	// An exit that just served us proves the lane-level refusal no longer
+	// describes upstream, so it must not outlive the condition it recorded.
+	p.ClearRefusal()
+}
+
+// RecordRefusal keeps a lane-level refusal and reports whether the record
+// changed. The window is only ever extended: a verdict taken later in the same
+// window reaches less far than the first one, and shortening the record would
+// make the lane resume probing before upstream said it may.
+func (p *anonymousPool) RecordRefusal(now time.Time, status int, retryAfter string, body []byte) bool {
+	if p == nil || status == 0 {
+		return false
+	}
+	deadline := now.Add(max(parseRetryAfter(retryAfter), p.cooldown))
+	if !deadline.After(now) {
+		deadline = now.Add(p.cooldown)
+	}
+	p.refusalMu.Lock()
+	defer p.refusalMu.Unlock()
+	if held := p.refusal; held != nil && !deadline.After(held.deadline) {
+		return false
+	}
+	p.refusal = &anonymousRefusal{
+		status:     status,
+		retryAfter: retryAfter,
+		body:       append([]byte(nil), body...),
+		deadline:   deadline,
+	}
+	return true
+}
+
+// Refusal returns the recorded refusal while it still describes the lane. The
+// Retry-After it carries counts down to the same deadline upstream named, so a
+// client backing off from it waits exactly as long as upstream asked.
+func (p *anonymousPool) Refusal(now time.Time) (anonymousRefusal, bool) {
+	if p == nil {
+		return anonymousRefusal{}, false
+	}
+	p.refusalMu.Lock()
+	defer p.refusalMu.Unlock()
+	held := p.refusal
+	if held == nil || !now.Before(held.deadline) {
+		return anonymousRefusal{}, false
+	}
+	kept := *held
+	if kept.retryAfter != "" {
+		remaining := int64(held.deadline.Sub(now).Seconds())
+		if remaining < 1 {
+			remaining = 1
+		}
+		kept.retryAfter = strconv.FormatInt(remaining, 10)
+	}
+	return kept, true
+}
+
+// ClearRefusal drops the recorded refusal.
+func (p *anonymousPool) ClearRefusal() {
+	if p == nil {
+		return
+	}
+	p.refusalMu.Lock()
+	p.refusal = nil
+	p.refusalMu.Unlock()
+}
+
+// FullyCooling reports whether every exit is inside a cooldown window. A cooling
+// exit cannot serve before its deadline, so while this holds no attempt can reach
+// an upstream that has not just refused the lane.
+func (p *anonymousPool) FullyCooling(now time.Time) bool {
+	if p == nil || len(p.nodes) == 0 {
+		return false
+	}
+	for _, node := range p.nodes {
+		if node.cooldownUntil.Load() <= now.UnixNano() {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, err error) {

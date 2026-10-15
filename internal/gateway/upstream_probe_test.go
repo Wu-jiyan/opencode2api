@@ -53,32 +53,51 @@ func TestPeekResponsePrefixReplaysBody(t *testing.T) {
 	}
 }
 
-// A free-tier rejection is a verdict on the anonymous lane's single identity,
-// so it stops the pool scan; everything the exit address could plausibly change
-// keeps rotating.
-func TestAnonymousRejectionIsDeterministic(t *testing.T) {
+// A lane refusal is a verdict on the anonymous lane's single identity and its
+// address block, so it stops the pool scan and is worth keeping for requests
+// that arrive while every exit cools; anything that could still be a statement
+// about this request or this exit keeps rotating.
+func TestAnonymousLaneRefusal(t *testing.T) {
 	quota := `{"type":"error","error":{"type":"FreeUsageLimitError",` +
 		`"message":"Free usage limit reached."}}`
+	rateLimited := `{"error":{"code":null,"message":"Rate limit exceeded. ` +
+		`Please try again later.","param":null,"type":"upstream_error"}}`
 	cases := []struct {
-		name   string
-		status int
-		body   string
-		want   bool
+		name       string
+		status     int
+		body       string
+		retryAfter string
+		want       bool
 	}{
-		{"403 free-tier identity rejection", http.StatusForbidden, freeTierRejectionBody, true},
-		{"403 quota body is accounted per exit, so keep rotating", http.StatusForbidden, quota, false},
-		{"403 with an unrecognisable body keeps rotating", http.StatusForbidden, "<html>cloudflare</html>", false},
-		{"429 quota exhaustion must keep rotating", http.StatusTooManyRequests, freeTierRejectionBody, false},
-		{"200 is not a rejection", http.StatusOK, freeTierRejectionBody, false},
+		{"403 free-tier identity rejection", http.StatusForbidden, freeTierRejectionBody, "", true},
+		{"403 quota body names another condition and keeps rotating", http.StatusForbidden, quota, "", false},
+		{"403 with an unrecognisable body keeps rotating", http.StatusForbidden, "<html>cloudflare</html>", "", false},
+		{"429 allowance verdict is kept, window included", http.StatusTooManyRequests, rateLimited, "3294", true},
+		{"400 shape rejection is about the request, not the lane", http.StatusBadRequest, rateLimited, "3294", false},
+		{"500 is about the exit and keeps rotating", http.StatusInternalServerError, rateLimited, "3294", false},
+		{"200 is not a refusal", http.StatusOK, rateLimited, "12", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			resp := &http.Response{
 				StatusCode: tc.status,
+				Header:     http.Header{"Retry-After": []string{tc.retryAfter}},
 				Body:       io.NopCloser(strings.NewReader(tc.body)),
 			}
-			if got := anonymousRejectionIsDeterministic(resp); got != tc.want {
-				t.Fatalf("anonymousRejectionIsDeterministic(%d) = %v, want %v", tc.status, got, tc.want)
+			refusal, got := anonymousLaneRefusal(resp)
+			if got != tc.want {
+				t.Fatalf("anonymousLaneRefusal(%d) = %v, want %v", tc.status, got, tc.want)
+			}
+			if got {
+				if refusal.status != tc.status {
+					t.Fatalf("kept status = %d, want %d", refusal.status, tc.status)
+				}
+				if refusal.retryAfter != tc.retryAfter {
+					t.Fatalf("kept Retry-After = %q, want %q", refusal.retryAfter, tc.retryAfter)
+				}
+				if string(refusal.body) != tc.body {
+					t.Fatalf("kept %d body bytes, want %d", len(refusal.body), len(tc.body))
+				}
 			}
 			// Classifying a response must never cost the caller its body,
 			// whichever way the verdict went.
@@ -91,7 +110,7 @@ func TestAnonymousRejectionIsDeterministic(t *testing.T) {
 			}
 		})
 	}
-	if anonymousRejectionIsDeterministic(nil) {
-		t.Fatal("a nil response must not be classified as a rejection")
+	if _, ok := anonymousLaneRefusal(nil); ok {
+		t.Fatal("a nil response must not be classified as a refusal")
 	}
 }
