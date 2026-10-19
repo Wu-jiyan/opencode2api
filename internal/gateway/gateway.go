@@ -284,6 +284,12 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 				httpx.DrainAndClose(resp.Body)
 				return
 			}
+			// Headers arrived but nothing followed them. That is what a dead exit
+			// looks like from here, and it must not hold the request until the
+			// whole request budget runs out: the attempt is abandoned and the
+			// request is replayed on the next node. Only the wait for the first
+			// byte is bounded — an established stream may run as long as it needs.
+			resp.Body = withFirstByteDeadline(resp.Body, g.cfg.Performance.FirstByteTimeout(time.Duration(g.cfg.Retry.TimeoutSeconds)*time.Second))
 			final := attempt >= g.cfg.Retry.MaxAttempts || requestCtx.Err() != nil || r.Context().Err() != nil
 			if stream {
 				w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
@@ -578,6 +584,7 @@ func isRestartableStreamRead(err error) bool {
 	return errors.Is(err, io.EOF) ||
 		errors.Is(err, io.ErrUnexpectedEOF) ||
 		errors.Is(err, wire.ErrSSETruncated) ||
+		errors.Is(err, errUpstreamStalled) ||
 		errors.Is(err, syscall.ECONNRESET) ||
 		errors.Is(err, syscall.EPIPE)
 }

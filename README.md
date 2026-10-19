@@ -458,18 +458,19 @@ Linux, Windows, and macOS are supported on amd64, arm64, 386, and arm (v7).
 
 ### Timeouts and connection pools
 
-| Field                                     | Default | Meaning                                                |
-| ----------------------------------------- | ------- | ------------------------------------------------------ |
-| `retry.max_attempts`                      | `3`     | Attempts per authenticated tier, including the first.  |
-| `retry.timeout_seconds`                   | `300`   | Total inference timeout, including stream consumption. |
-| `performance.attempt_timeout_seconds`     | `0`     | Header wait per attempt; 0 uses the request timeout.   |
-| `performance.connect_timeout_seconds`     | `5`     | Connection establishment timeout.                      |
-| `performance.failure_cooldown_seconds`    | `15`    | Base failure cooldown.                                 |
-| `performance.max_idle_conns`              | `2048`  | Idle connection limit per proxy transport.             |
-| `performance.max_idle_conns_per_host`     | `256`   | Idle connection limit per host and transport.          |
-| `performance.max_conns_per_host`          | `0`     | Connection limit per host; 0 is unlimited.             |
-| `performance.idle_conn_timeout_seconds`   | `120`   | Idle connection lifetime.                              |
-| `performance.connection_rotation_seconds` | `0`     | Idle connection recycling interval; 0 disables it.     |
+| Field                                     | Default | Meaning                                                                                                          |
+| ----------------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------- |
+| `retry.max_attempts`                      | `3`     | Attempts per authenticated tier, including the first.                                                            |
+| `retry.timeout_seconds`                   | `300`   | Total inference timeout, including stream consumption.                                                           |
+| `performance.attempt_timeout_seconds`     | `0`     | Header wait per attempt; 0 uses 45s, capped by the request timeout.                                              |
+| `performance.first_byte_timeout_seconds`  | `0`     | First-byte wait per attempt; 0 uses 120s. A silent exit is dropped and the request is replayed on the next node. |
+| `performance.connect_timeout_seconds`     | `5`     | Connection establishment timeout.                                                                                |
+| `performance.failure_cooldown_seconds`    | `15`    | Base failure cooldown.                                                                                           |
+| `performance.max_idle_conns`              | `2048`  | Idle connection limit per proxy transport.                                                                       |
+| `performance.max_idle_conns_per_host`     | `256`   | Idle connection limit per host and transport.                                                                    |
+| `performance.max_conns_per_host`          | `0`     | Connection limit per host; 0 is unlimited.                                                                       |
+| `performance.idle_conn_timeout_seconds`   | `120`   | Idle connection lifetime.                                                                                        |
+| `performance.connection_rotation_seconds` | `0`     | Idle connection recycling interval; 0 disables it.                                                               |
 
 The per-attempt header timeout is capped by the request timeout. Set it below the total timeout if a slow upstream should leave time for fallback. Expired request contexts stop further attempts without penalizing unused keys or proxies.
 

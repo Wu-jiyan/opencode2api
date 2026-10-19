@@ -740,8 +740,25 @@ opencode2api -config config.json
 
 - `retry.timeout_seconds`（默认 300 秒）是否过短
 - `performance.attempt_timeout_seconds` 是否需要设置，让慢节点不拖垮整体预算
+- `performance.first_byte_timeout_seconds`（默认 120 秒）——上游回了响应头却一直不给首字节时，放弃该次尝试并换节点重发
 - 代理是否可用（概览页可点"测试延迟"实测各节点首字节耗时）
 - 上游 Key 是否有效
+
+### 上游连上了却不吭声
+
+有些出口会把请求接走，然后一个字节都不回：隧道活着，上游却没响应。网关用两级超时
+区分这两种"没反应"：
+
+- `performance.attempt_timeout_seconds`（默认 45 秒）管**等响应头**——连头都没有，
+  直接放弃这次尝试；
+- `performance.first_byte_timeout_seconds`（默认 120 秒）管**等首字节**——头到了但正文
+  一个字节都没有，说明这个节点已经哑了：放弃这次尝试，**换一个节点把整个请求重发**。
+
+只护第一读：一旦流开始吐字，就按请求总超时（`retry.timeout_seconds`）算，模型慢慢想
+多久都不算超时。重发是"整个请求重放"——客户端看不到任何痕迹，因为还没有任何内容写出去。
+
+沉默的节点只被跳过、不被判坏：一个上游整体变慢时，每个节点看起来都一样，把节点
+摘掉会让池子空掉（这正是 `isProxyFailure` 只认"连不上"的原因）。
 
 ### HTTP 200 但生成失败
 

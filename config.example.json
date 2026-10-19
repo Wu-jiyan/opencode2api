@@ -55,6 +55,7 @@
     "connect_timeout_seconds": 5,
     "failure_cooldown_seconds": 15,
     "attempt_timeout_seconds": 0,
+    "first_byte_timeout_seconds": 0,
     "connection_rotation_seconds": 0
   },
   "logging": {

@@ -462,18 +462,19 @@ ipv6://2001:db8:1234:5600::1002
 
 ### 超时与连接池
 
-| 字段                                      | 默认值 | 含义                                             |
-| ----------------------------------------- | ------ | ------------------------------------------------ |
-| `retry.max_attempts`                      | `3`    | 每个认证 Tier 的尝试次数，包含首次请求。         |
-| `retry.timeout_seconds`                   | `300`  | 推理请求总超时，包含流式响应读取。               |
-| `performance.attempt_timeout_seconds`     | `0`    | 每次尝试等待响应头的超时；0 表示使用请求总超时。 |
-| `performance.connect_timeout_seconds`     | `5`    | 建立连接的超时。                                 |
-| `performance.failure_cooldown_seconds`    | `15`   | 失败冷却基数。                                   |
-| `performance.max_idle_conns`              | `2048` | 每个代理 Transport 的空闲连接上限。              |
-| `performance.max_idle_conns_per_host`     | `256`  | 每个 Transport 对单个主机的空闲连接上限。        |
-| `performance.max_conns_per_host`          | `0`    | 单个主机的连接上限；0 表示不限制。               |
-| `performance.idle_conn_timeout_seconds`   | `120`  | 空闲连接保留时间。                               |
-| `performance.connection_rotation_seconds` | `0`    | 空闲连接回收周期；0 表示不轮换。                 |
+| 字段                                      | 默认值 | 含义                                                                                                    |
+| ----------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------- |
+| `retry.max_attempts`                      | `3`    | 每个认证 Tier 的尝试次数，包含首次请求。                                                                |
+| `retry.timeout_seconds`                   | `300`  | 推理请求总超时，包含流式响应读取。                                                                      |
+| `performance.attempt_timeout_seconds`     | `0`    | 每次尝试等待响应头的超时；0 表示取 45 秒默认值（不超过请求总超时）。                                    |
+| `performance.first_byte_timeout_seconds`  | `0`    | 每次尝试等待首字节的超时；0 表示取 120 秒默认值。上游只回响应头却不给内容时，放弃本次尝试并换节点重发。 |
+| `performance.connect_timeout_seconds`     | `5`    | 建立连接的超时。                                                                                        |
+| `performance.failure_cooldown_seconds`    | `15`   | 失败冷却基数。                                                                                          |
+| `performance.max_idle_conns`              | `2048` | 每个代理 Transport 的空闲连接上限。                                                                     |
+| `performance.max_idle_conns_per_host`     | `256`  | 每个 Transport 对单个主机的空闲连接上限。                                                               |
+| `performance.max_conns_per_host`          | `0`    | 单个主机的连接上限；0 表示不限制。                                                                      |
+| `performance.idle_conn_timeout_seconds`   | `120`  | 空闲连接保留时间。                                                                                      |
+| `performance.connection_rotation_seconds` | `0`    | 空闲连接回收周期；0 表示不轮换。                                                                        |
 
 单次响应头超时不会超过请求总超时。希望慢节点仍能留出回退时间时，可以把它设为小于总超时的值。请求上下文过期后会停止后续尝试，不会惩罚尚未实际使用的 Key 或代理。
 

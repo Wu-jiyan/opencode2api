@@ -220,6 +220,13 @@ type PerformanceConfig struct {
 	// whole request budget, so one silent exit cannot stall a request until the
 	// client gives up.
 	AttemptTimeoutSeconds int `json:"attempt_timeout_seconds"`
+	// FirstByteTimeoutSeconds bounds how long an attempt may wait for the first
+	// response byte after the upstream answered with headers. A tunnel that
+	// accepts the request and then goes quiet is indistinguishable from a dead
+	// exit, and without this bound the attempt would sit there until the whole
+	// request budget ran out. Only that first wait is bounded: once the stream
+	// is alive it may take as long as it needs.
+	FirstByteTimeoutSeconds int `json:"first_byte_timeout_seconds"`
 	// ConnectionRotationSeconds recycles idle upstream connections so the next
 	// request dials again. A vless entry assigns a fresh exit IP to every new
 	// connection, so recycling is how the outbound IP is rotated; keep-alive
@@ -233,6 +240,12 @@ type PerformanceConfig struct {
 // long as it needs, while an exit that accepts a connection and then goes quiet
 // is abandoned quickly enough for the next candidate to answer.
 const defaultAttemptTimeout = 45 * time.Second
+
+// defaultFirstByteTimeout bounds the wait for the first response byte when
+// performance.first_byte_timeout_seconds is not set. It is long enough for a
+// model that thinks before it answers and short enough that a silent exit
+// cannot hold a request for the whole request budget.
+const defaultFirstByteTimeout = 120 * time.Second
 
 // maxVlessEdgeIPs bounds how many edge addresses one fixed link may be fanned
 // out across. Every entry becomes an extra listener (its own Xray process) for
@@ -260,6 +273,25 @@ func (cfg PerformanceConfig) AttemptTimeout(requestTimeout time.Duration) time.D
 		return requestTimeout
 	}
 	return attempt
+}
+
+// FirstByteTimeout bounds how long a single upstream attempt may wait for the
+// first response byte once the upstream has answered with headers. Values <= 0
+// keep a bounded default instead of the whole request budget: an exit that
+// accepted the request and then went silent would otherwise consume every
+// second of the request on its own.
+//
+// The bound never exceeds requestTimeout, and it only covers the first wait —
+// an established stream keeps flowing under the request-level timeout.
+func (cfg PerformanceConfig) FirstByteTimeout(requestTimeout time.Duration) time.Duration {
+	timeout := time.Duration(cfg.FirstByteTimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = defaultFirstByteTimeout
+	}
+	if requestTimeout > 0 && timeout > requestTimeout {
+		return requestTimeout
+	}
+	return timeout
 }
 
 func Load(path string) (Config, error) {
@@ -368,6 +400,9 @@ func Normalize(path string, cfg Config) (Config, error) {
 	}
 	if cfg.Performance.AttemptTimeoutSeconds < 0 {
 		return Config{}, errors.New("performance.attempt_timeout_seconds must not be negative (0 selects a bounded default)")
+	}
+	if cfg.Performance.FirstByteTimeoutSeconds < 0 {
+		return Config{}, errors.New("performance.first_byte_timeout_seconds must not be negative (0 selects a bounded default)")
 	}
 	if cfg.Performance.ConnectionRotationSeconds < 0 {
 		return Config{}, errors.New("performance.connection_rotation_seconds must not be negative (0 disables rotation)")
