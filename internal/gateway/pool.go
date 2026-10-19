@@ -182,14 +182,16 @@ func (c *anonymousCursor) NextUnvetted() *anonymousNode {
 		return nil
 	}
 	// The primary pass walks offset to the end before this is called, so it has
-	// to be rewound or the fallback would find nothing left to yield.
-	c.offset = 0
-	for c.offset < len(c.pool.nodes) {
-		node := c.pool.nodes[(c.start+c.offset)%len(c.pool.nodes)]
-		c.offset++
-		return node
+	// to be rewound or the fallback would find nothing left to yield. The rewind
+	// happens only once the walk has run out again: rewinding on every call would
+	// hand out the same exit for the whole attempt budget, so a request stuck
+	// behind cooling exits would spend every probe on one of them.
+	if c.offset >= len(c.pool.nodes) {
+		c.offset = 0
 	}
-	return nil
+	node := c.pool.nodes[(c.start+c.offset)%len(c.pool.nodes)]
+	c.offset++
+	return node
 }
 
 func (p *anonymousPool) MarkSuccess(node *anonymousNode) {
@@ -277,6 +279,18 @@ func (p *anonymousPool) FullyCooling(now time.Time) bool {
 
 func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, err error) {
 	if node == nil {
+		return
+	}
+	// A connection that broke before a status line says nothing about the exit:
+	// the request reached upstream and the answer never came back, which is one
+	// dropped connection rather than this exit being unusable. Cooling the exit
+	// for it is what turned a transient upstream flap into a self-sustaining
+	// outage: every drop cooled an exit, the whole pool ended up inside its
+	// cooldown windows, a cooling pool hands a request a single probe, and that
+	// probe's failure re-armed the window it had just run out of. Reachability is
+	// the only verdict a broken connection can carry, and syncProxyResult already
+	// records exactly that much through isProxyFailure.
+	if err != nil && !isProxyFailure(err) {
 		return
 	}
 	if err == nil && resp != nil && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {

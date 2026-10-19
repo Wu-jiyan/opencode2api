@@ -270,8 +270,9 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			// same refusal again, once per request, for as long as the window
 			// lasts. Answering from the record returns the same status, message
 			// and retry window the probe would have returned.
-			if attempts == 0 {
-				if refusal, ok := g.anonymous.Refusal(now); ok && g.anonymous.FullyCooling(now) {
+			refusal, refused := g.anonymous.Refusal(now)
+			if refused && g.anonymous.FullyCooling(now) {
+				if attempts == 0 {
 					// Answering from the record is still an anonymous-lane
 					// answer, so the request has to carry the lane's credential
 					// the same way a probed one does. Without this the access
@@ -283,8 +284,17 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 					g.logger.Debug("answering from the anonymous lane's recorded refusal", "component", "upstream", "event", "anonymous_refusal_replayed", "request_id", ids.Request, "status", refusal.status, "retry_after", refusal.retryAfter, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true)
 					return refusalResponse(refusal), nil, attempts
 				}
-				node = cursor.NextUnvetted()
+				// This request's own probe already collected the verdict the
+				// record holds, so the exits left in the walk can only answer
+				// with the same one.
+				break
 			}
+			// No verdict describes the lane, so the cooling windows only record
+			// per-exit trouble. A cooling exit can still be the one that serves
+			// this request, and giving up after a single probe turns a transient
+			// upstream flap into a guaranteed client-visible failure. Keep
+			// walking the unvetted exits for the rest of the attempt budget.
+			node = cursor.NextUnvetted()
 			if node == nil {
 				break
 			}
