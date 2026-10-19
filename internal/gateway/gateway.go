@@ -163,6 +163,19 @@ func (g *Gateway) authenticate(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// unsupportedModelMessage explains why a model cannot be routed. An id the
+// catalog has never heard of is simply not available here; only an id it knows
+// can be rejected because its upstream protocol is not exposed. Naming the wrong
+// cause sends callers after a protocol bug that does not exist — measured
+// 2026-10-19 with cat-jam, which the endpoint tables declare and upstream serves
+// while the machine catalog does not list it.
+func (g *Gateway) unsupportedModelMessage(model string) string {
+	if g.catalog != nil && g.catalog.Known(model) {
+		return "the model uses an upstream protocol that opencode2api does not expose"
+	}
+	return fmt.Sprintf("model %q is not available in the configured Zen or Go pools", model)
+}
+
 func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBody))
@@ -189,7 +202,7 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			return
 		}
 		if !g.catalog.Supported(model) {
-			wire.WriteError(w, external, http.StatusBadRequest, "the model uses an upstream protocol that opencode2api does not expose", "invalid_request_error", "model")
+			wire.WriteError(w, external, http.StatusBadRequest, g.unsupportedModelMessage(model), "invalid_request_error", "model")
 			return
 		}
 		route, err := g.catalog.Route(model, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0, g.cfg.Anonymous)
@@ -395,7 +408,7 @@ func (g *Gateway) handleSystemOne(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !g.catalog.Supported(model) {
-		wire.WriteError(w, wire.SystemOne, http.StatusBadRequest, "the model uses an upstream protocol that opencode2api does not expose", "invalid_request_error", "model")
+		wire.WriteError(w, wire.SystemOne, http.StatusBadRequest, g.unsupportedModelMessage(model), "invalid_request_error", "model")
 		return
 	}
 	route, err := g.catalog.Route(model, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0, g.cfg.Anonymous)

@@ -151,3 +151,55 @@ func TestDeprecatedZeroCostModelIsStillMetadataFree(t *testing.T) {
 		t.Fatalf("paid model decision = %+v, want a rejected paid decision", paid)
 	}
 }
+
+// The published endpoint tables can declare a model the machine catalog does not
+// list. Those IDs are addressable even though the advertised list must keep
+// showing only what upstream enumerates: measured 2026-10-19, cat-jam-free
+// answers 200 while /inference/v1/models omits it, so requiring a listing made a
+// working model unreachable behind a misleading "protocol not exposed" error.
+func TestDocumentedButUnlistedFreeModelIsRoutable(t *testing.T) {
+	catalog := NewCatalog(config.TierZen, nil)
+	catalog.ReplaceWithCapabilities(
+		[]string{"space-bunny-free"},
+		nil, nil, nil, nil,
+		map[config.Tier]map[string]wire.Protocol{config.TierZen: {"cat-jam-free": wire.Chat}},
+	)
+
+	route, err := catalog.Route("cat-jam-free", false, false, true)
+	if err != nil {
+		t.Fatalf("a documented free model must be routable: %v", err)
+	}
+	if !route.Anonymous || route.Tier != config.TierZen {
+		t.Fatalf("route = %+v, want the anonymous Zen lane", route)
+	}
+	if route.Protocol != wire.Chat {
+		t.Fatalf("protocol = %q, want the documented chat", route.Protocol)
+	}
+	if !catalog.Supported("cat-jam-free") {
+		t.Fatal("a documented model must not be reported as an unsupported protocol")
+	}
+	if !catalog.Known("cat-jam-free") {
+		t.Fatal("a documented model must count as known")
+	}
+	// It must stay out of the advertised list: the client should enumerate what
+	// upstream lists, not every id a document happens to mention.
+	for _, id := range catalog.List() {
+		if id == "cat-jam-free" {
+			t.Fatal("a documented-but-unlisted model must not be advertised")
+		}
+	}
+}
+
+// An id nothing declares is simply unknown, and that has to read differently from
+// a model we know but cannot expose.
+func TestUnknownModelIsNotReportedAsAProtocolProblem(t *testing.T) {
+	catalog := NewCatalog(config.TierZen, nil)
+	catalog.ReplaceWithCapabilities([]string{"space-bunny-free"}, nil, nil, nil, nil, nil)
+
+	if catalog.Known("nope-free") {
+		t.Fatal("an id nothing declares must not count as known")
+	}
+	if catalog.Supported("nope-free") {
+		t.Fatal("an unknown id must not be routable")
+	}
+}

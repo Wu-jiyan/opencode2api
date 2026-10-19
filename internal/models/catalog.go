@@ -241,8 +241,13 @@ func (c *Catalog) routeLocked(model string, hasZenKeys, hasGoKeys, hasAnonymous 
 	// there, even if the current catalog only advertises it on Go: an upstream
 	// rejection will move the request into the authenticated fallback plan.
 	decision := c.anonymousDecision(model)
+	// A published endpoint table can declare a model the machine catalog does not
+	// list. Those IDs are addressable even though enumerating /v1/models must keep
+	// showing only what upstream lists: measured 2026-10-19, cat-jam-free answers
+	// 200 while /inference/v1/models omits it, so requiring a listing here made a
+	// working model unreachable.
 	if hasAnonymous && decision.Allowed && (c.protocols[model] != "" || !c.unsupported[config.TierZen][model]) &&
-		(len(c.zen) == 0 && len(c.goModels) == 0 || c.zen[model] || c.goModels[model]) {
+		(len(c.zen) == 0 && len(c.goModels) == 0 || c.zen[model] || c.goModels[model] || c.documentedLocked(model)) {
 		protocols := c.protocolsForLocked(model, keyTiers, true)
 		return Route{ID: model, Tier: config.TierZen, Protocol: protocols[config.TierZen], Protocols: protocols, Anonymous: true, KeyTiers: keyTiers}, nil
 	}
@@ -491,11 +496,52 @@ func (c *Catalog) supportedLocked(model string) bool {
 	if len(c.zen) == 0 && len(c.goModels) == 0 {
 		return true
 	}
-	if c.zen[model] && c.tierSupportedLocked(model, config.TierZen) {
+	// A documented model is servable, which is why it is not reported as an
+	// unsupported protocol; see documentedLocked.
+	if (c.zen[model] || c.docs[config.TierZen][model] != "") && c.tierSupportedLocked(model, config.TierZen) {
 		return true
 	}
-	if c.goModels[model] && c.tierSupportedLocked(model, config.TierGo) {
+	if (c.goModels[model] || c.docs[config.TierGo][model] != "") && c.tierSupportedLocked(model, config.TierGo) {
 		return true
+	}
+	return false
+}
+
+// documentedLocked reports whether the published endpoint tables declare the
+// model. Those tables are the one place a model exists without appearing in the
+// machine catalog's listing, so a caller can address it while /v1/models still
+// shows only what upstream enumerates.
+func (c *Catalog) documentedLocked(model string) bool {
+	for _, tier := range []config.Tier{config.TierZen, config.TierGo} {
+		if c.docs[tier][model] != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// Known reports whether the catalog has any trace of the id at all. It separates
+// "this protocol cannot be exposed" from "this id does not exist here", which are
+// different answers for whoever sent the request.
+func (c *Catalog) Known(model string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.knownLocked(model)
+}
+
+func (c *Catalog) knownLocked(model string) bool {
+	if len(c.zen) == 0 && len(c.goModels) == 0 {
+		// Nothing has been discovered yet; claiming an id is unknown would blame
+		// the caller for our own empty catalog.
+		return true
+	}
+	if c.zen[model] || c.goModels[model] || c.documentedLocked(model) {
+		return true
+	}
+	for _, tier := range []config.Tier{config.TierZen, config.TierGo} {
+		if c.nativeProtocols[tier][model] != "" {
+			return true
+		}
 	}
 	return false
 }
