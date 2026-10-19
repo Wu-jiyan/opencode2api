@@ -61,12 +61,14 @@ python tools/cf_ip_scan.py --per-net 10 --top 24 --hold 150 --workers 12
 # 只扫第一阶段（快，几秒）
 python tools/cf_ip_scan.py --phase1-only
 
-# 把结果写成 vless:// 节点写进 config.json
-python tools/cf_ip_scan.py --apply --template "<完整的 vless:// 链接>"
+# 把通过的地址写进 config.json 的 vless.edge_ips（推荐）
+python tools/cf_ip_scan.py --apply
+
+# 旧行为：把边缘 IP 套进模板、改写成 vless.nodes
+python tools/cf_ip_scan.py --apply-nodes --template "<完整的 vless:// 链接>"
 ```
 
-> **注意**：换 CF 边缘 IP 改变的是**链路质量和出口 IP**，不改变节点本身的身份。
-> 经验上它对延迟和限流有用，但**不能修复长流被截断**——那通常是隧道层的问题。
+> **注意**：换 CF 边缘 IP 改变的是**链路质量**和**隧道条数**，不改变节点身份，也**不会**增加"出口 IP 桶"——出口地址由 Cloudflare 决定，与本机选的入口 IP 不一一对应（实测 2 个 worker × 3 个入口只对应 3 个出口 IP）。经验上它对延迟和并发有用，但**不能修复长流被截断**——那通常是隧道层的问题。
 
 ### `sse_survive_test.py` — 长流存活判定器
 
@@ -84,15 +86,19 @@ python tools/sse_survive_test.py 104.16.0.1 1.1.1.1  # 指定 IP
 
 串行跑，别一次并发太多——免费额度会先被打爆，你会看到一堆 429 而不是真实结果。
 
-### `check_egress_ip.py` — 出口 IP 轮换验证
+### `check_egress_ip.py` — 出口 IP 观测
 
-edgetunnel 这类部署在 CF Pages/Workers 上的节点，出口就是 Cloudflare 的网络，
-所以换边缘 IP 就会换出口 IP。这个脚本起一个指向指定边缘 IP 的 Xray，
-然后查出口 IP，验证是否真的在变。
+edgetunnel 这类部署在 CF Pages/Workers 上的节点，出口是 **Cloudflare 自己的网络**，不是你的机器。这个脚本起一个指向指定边缘 IP 的 Xray，然后查出口 IP。
 
 ```bash
 python tools/check_egress_ip.py 108.162.192.1 104.16.0.1
 ```
+
+**实测结论（2026-10-19，2 个 worker × 3 个入口）**：出口 IP 由 Cloudflare 分配，与入口 IP **不一一对应** —— 6 个入口只观察到 3 个出口（`104.28.164.140` / `104.28.152.191` / `104.28.164.148`，同一 colo），且短时间内对同一 listener 保持稳定。所以：
+
+- 多入口 = **多条隧道、更高并发**，不是"更多出口 IP 桶"；
+- 出口 IP 会变，但由 CF 决定，不能用"换入口"精确控制；
+- 想观测它变不变，可以用这个脚本在不同时间点各跑一次。
 
 ## 排障思路
 

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -82,6 +83,15 @@ type VlessConfig struct {
 	// substitute for a node's address. The rest of the link — UUID, SNI, host,
 	// path, transport — is preserved, because only the edge address changes.
 	PreferredDomains []string `json:"preferred_domains"`
+	// EdgeIPs are anycast CDN edge addresses (Cloudflare preferred IPs) used as
+	// the entry point of every fixed node. A Cloudflare-fronted worker is
+	// reachable through any address that serves its zone, so the address in the
+	// share link is only one of many entry points; each listed IP produces an
+	// extra listener for the same worker. Only the address changes — UUID, SNI,
+	// host, path and transport stay exactly as the link declared. This is how
+	// one worker is fanned out into a pool of independent tunnels, which raises
+	// concurrency without touching the worker's own request budget.
+	EdgeIPs []string `json:"edge_ips"`
 	// Endpoints are alternative origins for the same service, for example
 	// several edn2/edn3-style hostnames. Candidates receive them round-robin so
 	// each origin's request budget is spent at an even rate instead of draining
@@ -223,6 +233,12 @@ type PerformanceConfig struct {
 // long as it needs, while an exit that accepts a connection and then goes quiet
 // is abandoned quickly enough for the next candidate to answer.
 const defaultAttemptTimeout = 45 * time.Second
+
+// maxVlessEdgeIPs bounds how many edge addresses one fixed link may be fanned
+// out across. Every entry becomes an extra listener (its own Xray process) for
+// every link, so the ceiling keeps a copy-pasted list from turning into hundreds
+// of child processes the operator never intended to run.
+const maxVlessEdgeIPs = 64
 
 // AttemptTimeout bounds how long a single upstream attempt may wait for
 // response headers before it is abandoned and the next node is tried. Values
@@ -429,14 +445,29 @@ func normalizeVless(cfg *Config) error {
 	trimList(&cfg.Vless.Nodes)
 	trimList(&cfg.Vless.PreferredDomains)
 	trimList(&cfg.Vless.Endpoints)
+	trimList(&cfg.Vless.EdgeIPs)
 	cfg.Vless.Nodes = UniqueStrings(cfg.Vless.Nodes)
 	cfg.Vless.PreferredDomains = UniqueStrings(cfg.Vless.PreferredDomains)
 	cfg.Vless.Endpoints = UniqueStrings(cfg.Vless.Endpoints)
+	cfg.Vless.EdgeIPs = UniqueStrings(cfg.Vless.EdgeIPs)
 	if cfg.Vless.XrayVersion != "" && !strings.HasPrefix(cfg.Vless.XrayVersion, "v") {
 		cfg.Vless.XrayVersion = "v" + cfg.Vless.XrayVersion
 	}
 	if !cfg.Vless.Enabled {
 		return nil
+	}
+	// A mistyped entry would expand into a listener that can never connect, and
+	// the failure would look like a flaky worker rather than a bad address, so
+	// every entry has to be a literal IP. Validation only runs while the pool is
+	// enabled, matching the rule that an unused block never breaks a
+	// configuration.
+	for _, edge := range cfg.Vless.EdgeIPs {
+		if _, err := netip.ParseAddr(edge); err != nil {
+			return fmt.Errorf("vless.edge_ips entry %q is not an IP address", edge)
+		}
+	}
+	if len(cfg.Vless.EdgeIPs) > maxVlessEdgeIPs {
+		return fmt.Errorf("vless.edge_ips accepts at most %d addresses", maxVlessEdgeIPs)
 	}
 	// A pool needs candidates from somewhere: either a subscription or at least
 	// one fixed node. Accepting both lets a fixed node act as a stable fallback

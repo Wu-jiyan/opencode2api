@@ -300,6 +300,29 @@ def emit_vless_nodes(rows: list[Probe], template: str, count: int) -> list[str]:
     return out
 
 
+def apply_edge_ips(rows: list[Probe], path: str, count: int) -> bool:
+    """
+    把通过长连接测试的边缘 IP 写进 vless.edge_ips。
+
+    这是推荐的落地方式: 节点链接保持原样(UUID/SNI/host/path/transport 都不动),
+    只把入口地址池交给网关展开 —— 一条链接会按 edge_ips 的每个地址各起一个
+    listener, 所以扫出几个能撑住长连接的边缘 IP, 就有几条独立隧道。
+    """
+    with open(path, "r", encoding="utf-8-sig") as fh:
+        cfg = json.load(fh)
+    vless = cfg.setdefault("vless", {})
+    edges = [p.ip for p in rows[:count]]
+    vless["edge_ips"] = edges
+    backup = path + ".bak-cfscan"
+    if not os.path.exists(backup):
+        os.replace(path, backup)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, indent=4, ensure_ascii=False)
+    print(f"[+] 已写入 {path} (原文件备份为 {backup})")
+    print(f"[i] edge_ips={edges}")
+    return True
+
+
 def apply_to_config(nodes: list[str], path: str, count: int) -> bool:
     with open(path, "r", encoding="utf-8-sig") as fh:
         cfg = json.load(fh)
@@ -330,10 +353,13 @@ def main() -> int:
     ap.add_argument("--phase1-only", action="store_true", help="只跑阶段1")
     ap.add_argument("--workers", type=int, default=PHASE2_WORKERS,
                     help=f"阶段2 并发(默认 {PHASE2_WORKERS}; 挂住的 TLS 连接几乎不耗 CPU)")
-    ap.add_argument("--apply", action="store_true", help="把结果写入 config.json")
+    ap.add_argument("--apply", action="store_true",
+                    help="把通过的边缘 IP 写入 config.json 的 vless.edge_ips(推荐)")
+    ap.add_argument("--apply-nodes", action="store_true",
+                    help="旧行为: 把边缘 IP 套进 --template 生成 vless.nodes")
     ap.add_argument("--config", default="config.json")
     ap.add_argument("--template", default=os.environ.get("CF_VLESS_TEMPLATE", ""),
-                    help="vless:// 模板, --apply 时需要")
+                    help="vless:// 模板, --apply-nodes 时需要")
     args = ap.parse_args()
 
     if not TARGET_HOST:
@@ -375,8 +401,10 @@ def main() -> int:
         print(f"[i] 只有 {len(survivors)} 个通过, 建议加大 --per-net 或 --top 重跑")
 
     if args.apply:
+        apply_edge_ips(survivors, args.config, args.top)
+    if args.apply_nodes:
         if not args.template:
-            print("[!] --apply 需要 --template (一个完整的 vless:// 链接)")
+            print("[!] --apply-nodes 需要 --template (一个完整的 vless:// 链接)")
             return 2
         nodes = emit_vless_nodes(survivors, args.template, 7)
         apply_to_config(nodes, args.config, 7)

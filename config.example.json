@@ -11,6 +11,7 @@
     "subscription": "https://example.com/subscription",
     "nodes": [],
     "preferred_domains": [],
+    "edge_ips": [],
     "endpoints": [],
     "count": 24,
     "refresh_seconds": 300,

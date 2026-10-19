@@ -15,7 +15,7 @@ const (
 )
 
 func TestParseFixedNodesExpandsAcrossPreferredDomains(t *testing.T) {
-	nodes, err := ParseFixedNodes([]string{cfLink}, []string{"cf.example.com", "ct.example.com"}, nil)
+	nodes, err := ParseFixedNodes([]string{cfLink}, []string{"cf.example.com", "ct.example.com"}, nil, nil)
 	if err != nil {
 		t.Fatalf("ParseFixedNodes: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestParseFixedNodesExpandsAcrossPreferredDomains(t *testing.T) {
 // domain would hand the operator a route they never asked for.
 func TestParseFixedNodesKeepsUnrelatedAddress(t *testing.T) {
 	const link = "vless://uuid@203.0.113.9:443?security=tls&type=tcp"
-	nodes, err := ParseFixedNodes([]string{link}, []string{"cf.example.com"}, nil)
+	nodes, err := ParseFixedNodes([]string{link}, []string{"cf.example.com"}, nil, nil)
 	if err != nil {
 		t.Fatalf("ParseFixedNodes: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestParseFixedNodesKeepsUnrelatedAddress(t *testing.T) {
 }
 
 func TestParseFixedNodesWithoutDomains(t *testing.T) {
-	nodes, err := ParseFixedNodes([]string{cfLink}, nil, nil)
+	nodes, err := ParseFixedNodes([]string{cfLink}, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("ParseFixedNodes: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestParseFixedNodesWithoutDomains(t *testing.T) {
 }
 
 func TestParseFixedNodesRejectsBadLink(t *testing.T) {
-	if _, err := ParseFixedNodes([]string{"https://example.com"}, nil, nil); err == nil {
+	if _, err := ParseFixedNodes([]string{"https://example.com"}, nil, nil, nil); err == nil {
 		t.Fatal("expected an error for a non-vless link")
 	}
 }
@@ -85,7 +85,7 @@ func TestParseFixedNodesSpreadsEndpoints(t *testing.T) {
 	nodes, err := ParseFixedNodes([]string{cfLink}, []string{
 		"cf1.example.com", "ct.example.com", "cm.example.com",
 		"cu.example.com", "as.example.com", "eu.example.com",
-	}, endpoints)
+	}, endpoints, nil)
 	if err != nil {
 		t.Fatalf("ParseFixedNodes: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestParseFixedNodesSpreadsEndpoints(t *testing.T) {
 }
 
 func TestParseFixedNodesWithoutEndpointsKeepsHost(t *testing.T) {
-	nodes, err := ParseFixedNodes([]string{cfLink}, []string{"cf.example.com"}, nil)
+	nodes, err := ParseFixedNodes([]string{cfLink}, []string{"cf.example.com"}, nil, nil)
 	if err != nil {
 		t.Fatalf("ParseFixedNodes: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestParseFixedNodesWithoutEndpointsKeepsHost(t *testing.T) {
 }
 
 func TestApplyPreferredOrderKeepsUnknownAtEnd(t *testing.T) {
-	nodes, err := ParseFixedNodes([]string{cfLink}, []string{"cf.example.com", "ct.example.com", "cu.example.com"}, nil)
+	nodes, err := ParseFixedNodes([]string{cfLink}, []string{"cf.example.com", "ct.example.com", "cu.example.com"}, nil, nil)
 	if err != nil {
 		t.Fatalf("ParseFixedNodes: %v", err)
 	}
@@ -141,5 +141,51 @@ func TestApplyPreferredOrderKeepsUnknownAtEnd(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("order = %v, want %v", got, want)
 		}
+	}
+}
+
+// Edge addresses are entry points, not origins: every listed edge becomes an
+// extra listener for the same worker, and nothing else about the link may move.
+func TestParseFixedNodesExpandsAcrossEdgeIPs(t *testing.T) {
+	edges := []string{"198.51.100.7", "198.51.100.8"}
+	nodes, err := ParseFixedNodes([]string{cfLink}, nil, nil, edges)
+	if err != nil {
+		t.Fatalf("ParseFixedNodes: %v", err)
+	}
+	if len(nodes) != len(edges) {
+		t.Fatalf("got %d nodes, want %d (one per edge)", len(nodes), len(edges))
+	}
+	for i, edge := range edges {
+		if nodes[i].Address != edge {
+			t.Errorf("node %d address = %q, want %q", i, nodes[i].Address, edge)
+		}
+		if nodes[i].UUID != cfUUID || nodes[i].SNI != cfOrigin || nodes[i].Host != cfOrigin {
+			t.Errorf("node %d lost its identity: uuid=%q sni=%q host=%q", i, nodes[i].UUID, nodes[i].SNI, nodes[i].Host)
+		}
+		if nodes[i].Path != "/?ed=2560" || nodes[i].Port != 443 || nodes[i].Network != "ws" {
+			t.Errorf("node %d lost its transport", i)
+		}
+	}
+}
+
+// With several links the expansion is ordered by edge, so a listener budget that
+// is smaller than the full product still covers every worker instead of filling
+// up on the first one.
+func TestExpandEdgeIPsCoversEveryWorkerFirst(t *testing.T) {
+	first := Node{Address: "origin-a.example.com", UUID: "a", Port: 443}
+	second := Node{Address: "origin-b.example.com", UUID: "b", Port: 443}
+	nodes := expandEdgeIPs([]Node{first, second}, []string{"198.51.100.1", "198.51.100.2"})
+	if len(nodes) != 4 {
+		t.Fatalf("got %d nodes, want 4", len(nodes))
+	}
+	wantAddresses := []string{"198.51.100.1", "198.51.100.1", "198.51.100.2", "198.51.100.2"}
+	wantUUIDs := []string{"a", "b", "a", "b"}
+	for i := range nodes {
+		if nodes[i].Address != wantAddresses[i] || nodes[i].UUID != wantUUIDs[i] {
+			t.Fatalf("node %d = %s/%s, want %s/%s", i, nodes[i].Address, nodes[i].UUID, wantAddresses[i], wantUUIDs[i])
+		}
+	}
+	if got := expandEdgeIPs([]Node{first}, nil); len(got) != 1 || got[0].Address != first.Address {
+		t.Fatalf("no edges must leave the candidates untouched, got %+v", got)
 	}
 }

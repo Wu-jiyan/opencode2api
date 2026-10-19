@@ -309,21 +309,32 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		// and TLS handshake per remaining proxy before the client is told the
 		// same thing. This mirrors the rule the authenticated lane already
 		// applies; auth, throttling and server failures still rotate.
+		//
+		// A refusal only speaks for the whole lane when the gateway owns the
+		// exit's source address: every pinned address sits in the same block, so
+		// a block-level verdict covers all of them and rotating would just
+		// collect it again. A proxy exit reaches upstream through an egress the
+		// gateway does not own, so its refusal is that egress's own answer and
+		// the next exit may well succeed — recording it lane-wide would refuse
+		// traffic a working exit could have served.
 		refusal, laneRefusal := anonymousLaneRefusal(resp)
-		if laneRefusal {
+		laneWide := laneRefusal && laneLevelVerdict(node.proxy)
+		if laneWide {
 			if recorded := g.anonymous.RecordRefusal(now, refusal.status, refusal.retryAfter, refusal.body); recorded {
 				g.logger.Warn("anonymous lane refused by upstream", "component", "upstream", "event", "anonymous_lane_refused", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "status", refusal.status, "retry_after", refusal.retryAfter, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds())
 			}
+		} else if laneRefusal {
+			g.logger.Debug("exit refused the request; rotating to another egress", "component", "upstream", "event", "anonymous_exit_refused", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "status", refusal.status, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds())
 		}
 		if isNonRetryableClientResponse(resp, err) {
 			g.logger.Debug("anonymous upstream rejected a non-retryable request", "component", "upstream", "event", "anonymous_attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "status", resp.StatusCode, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds())
 			return resp, nil, attempts
 		}
-		// A free-tier identity rejection is the same kind of verdict, but it
-		// arrives as 403, which the check above deliberately lets rotate for the
-		// authenticated tiers. The anonymous lane has no per-exit credential to
-		// rotate onto, so it can only make the rejection worse.
-		if laneRefusal && refusal.status == http.StatusForbidden {
+		// A free-tier identity rejection arrives as 403, which the check above
+		// deliberately lets rotate for the authenticated tiers. For the anonymous
+		// lane it is a verdict on its one identity — but only while the exit's
+		// source address is ours to change; see laneLevelVerdict.
+		if laneWide && refusal.status == http.StatusForbidden {
 			g.logger.Debug("anonymous upstream rejected our client identity; stopping rotation", "component", "upstream", "event", "anonymous_identity_rejected", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "status", resp.StatusCode, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds())
 			return resp, nil, attempts
 		}
@@ -878,19 +889,42 @@ func isNonRetryableClientResponse(resp *http.Response, err error) bool {
 // a request did not come from the official client.
 const freeTierRejectionMarker = "FreeTierError"
 
-// anonymousLaneRefusal reports whether a response is a verdict on the anonymous
-// lane itself rather than on the request or on the exit that served it, and
-// returns the answer worth keeping.
+// laneLevelVerdict reports whether a refusal from this exit speaks for the whole
+// anonymous lane instead of for that exit's own egress.
 //
-// Two answers qualify. A free-tier identity rejection says the lane's client
-// fingerprint was refused; a rate limit says the lane's address block is out of
-// allowance. Neither is about the exit: the lane has exactly one identity, the
-// shared "public" credential plus one spoofed client fingerprint, so every
-// remaining exit would answer identically. Rotating on one buys a tunnel and a
-// TLS handshake per exit, and upstream counts each rejected request against the
-// caller, so scanning the pool multiplies the very rejections that caused the
-// first one. During the 2026-10-14 outage that turned a sub-second rejection
-// into 12-184s client latencies.
+// The distinction is who owns the address upstream saw. A pinned local source
+// (`ipv6://…`) or a direct connection uses an address the gateway owns, and all
+// such exits sit in the same block, so a refusal covers every one of them:
+// rotating only collects the same answer again, which is what turned the
+// 2026-10-14 identity outage into 12-184s client latencies. A proxy exit
+// (`socks5://…`, `http://…`) reaches upstream through an egress the gateway does
+// not own — a Cloudflare Worker's outbound address, for instance — so its
+// refusal is that egress's own answer and the next exit can well succeed.
+func laneLevelVerdict(proxy *proxyTransport) bool {
+	if proxy == nil {
+		// No exit attribution means the answer cannot be pinned on an egress;
+		// treat it as a statement about the lane, which is the conservative read.
+		return true
+	}
+	name := strings.TrimSpace(proxy.name)
+	if name == "" || strings.EqualFold(name, "direct") {
+		return true
+	}
+	_, pinned := config.ParseIPv6ProxyAddr(name)
+	return pinned
+}
+
+// anonymousLaneRefusal reports whether a response is a refusal this lane keeps:
+// a free-tier identity rejection (403) or a rate limit (429), returned together
+// with the answer worth replaying.
+//
+// Whether such a refusal may also stop the pool scan is a separate question,
+// answered by laneLevelVerdict: it depends on who owns the address upstream saw.
+// Either way the anonymous lane has exactly one identity (the shared "public"
+// credential plus one spoofed client fingerprint), so for a pinned-source exit
+// every remaining exit would answer identically, and scanning the pool only
+// multiplies the rejection. During the 2026-10-14 outage that turned a
+// sub-second rejection into 12-184s client latencies.
 //
 // A request-shape rejection (400 and friends) is deliberately not recorded: it
 // is a statement about the request body, so replaying it would answer a later

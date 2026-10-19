@@ -281,13 +281,16 @@ Besides a subscription you can configure fixed `vless://` links directly. That s
 
 `preferred_domains` replaces a fixed node's **entry address** with every value in the list, producing one candidate each while keeping the UUID, SNI, host, path, and transport untouched. A single link can therefore fill several independent egress routes. A node whose address is a literal IP and appears in no list is used as-is and never rewritten.
 
+`edge_ips` is the IP form of the same idea and the recommended way to scale a Cloudflare-fronted node: Cloudflare routes by SNI, so **any edge address that serves the zone is a valid entry**, and one link with N edge addresses becomes N independent tunnels (N listeners, one Xray process each). Only the address changes — UUID, SNI, host, path and transport stay exactly as the link declared. The expansion is ordered by edge first, so a `count` smaller than the full product still covers every worker before giving one of them a second listener. Up to 64 addresses, each a literal IP (a hostname is rejected outright rather than turning into a listener that can never connect). `tools/cf_ip_scan.py --apply` finds these addresses — including a 150-second long-connection hold test, because an edge that completes a TLS handshake is not necessarily one that survives an SSE stream — and writes them into `edge_ips`.
+
 ```json
 "vless": {
   "enabled": true,
   "subscription": "",
   "nodes": ["vless://uuid@ct.example.com:443?security=tls&sni=edn2.example.com&type=ws&host=edn2.example.com&path=%2F"],
-  "preferred_domains": ["cf.example.com", "ct.example.com", "cu.example.com"],
-  "endpoints": ["edn2.example.com", "edn3.example.com", "edn4.example.com"],
+  "preferred_domains": [],
+  "edge_ips": ["104.16.0.1", "104.19.0.1", "172.66.0.1", "188.114.96.1"],
+  "endpoints": [],
   "count": 7
 }
 ```
@@ -419,7 +422,12 @@ From `v1.3.3` the five core tools (`bash`, `edit`, `glob`, `grep`, `read`) are a
 
 From `v1.3.4` the `User-Agent` is the real client's string (`opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14`) instead of one assembled from the Go runtime — the old form, `opencode/1.18.31 (linux amd64; go1.24.13)`, was the only UA measured to be refused, and the `go1.…` marker is almost certainly why. `x-opencode-project` now defaults to `global` (a client's own value passes through) instead of a synthesised `prj_…`, and `x-opencode-request` is a `msg_` plus ascending identifier rather than `req_…`. All three are needed together: fixing any one alone still answers 403.
 
-**A `403 FreeTierError` must not be retried.** The anonymous lane has exactly one identity (the shared `public` credential plus one client fingerprint), so rotating exits cannot change the verdict. Scanning the whole pool only multiplies it: during the 2026-10-14 outage client latency grew from sub-second to the 12–184s range for a rejection that takes 0.5s to decide. The gateway now **stops** on this response and records `anonymous_identity_rejected`.
+**A `403 FreeTierError` is a verdict on whoever owns the exit's source address.** The anonymous lane has exactly one identity (the shared `public` credential plus one client fingerprint), but that says nothing about who owns the address upstream saw:
+
+- **The address is ours** (`ipv6://` pinned sources, `direct`): every such exit sits in one block, so rotating cannot change the verdict — scanning the pool only multiplies it. During the 2026-10-14 outage client latency grew from sub-second to the 12–184s range for a rejection that takes 0.5s to decide. The gateway **stops** on this response and records `anonymous_identity_rejected`.
+- **The address is not ours** (`socks5://` / `http://` proxy exits, a Cloudflare Worker's egress for example): the refusal is that egress's own answer, and the next listener may well succeed. From `v1.3.8` such an exit **keeps rotating** (`anonymous_exit_refused`, debug level) and the refusal is _not_ recorded lane-wide — recording it would let one bad egress refuse traffic the rest of the pool could have served.
+
+The gateway classifies this from the exit name, so nothing has to be configured.
 
 **A `429` is a verdict on the lane too, and is now treated like one.** It is an allowance judgement on the client address block (see the boundary note above), so no exit can escape it. From `v1.3.6` the lane **keeps the last lane-level refusal** — a `429`, or the `403 FreeTierError` identity verdict — and once every exit is cooling it answers later requests from that record: same status, same message, `Retry-After` counting down to the same deadline, without touching an upstream that has already spoken. It logs `anonymous_lane_refused` when the window is learned and `anonymous_refusal_replayed` for each request answered from it. The record is dropped as soon as a request is served again, and expires exactly when upstream said it would, so recovery needs no intervention. A successful catalog refresh deliberately does **not** drop it: that route answers `200` even while inference is rate-limited (the same trap that made a retired inference path look alive), so clearing on it would send the next request back to probing. Before this, an exhausted lane still fired one probe per request for the entire window — on 2026-10-15 that was 378,700-odd requests over six and a half hours, each one still reaching an endpoint that had asked the caller to wait fifty-five minutes.
 

@@ -387,7 +387,7 @@ func (p *Pool) rankFixedNodes(ctx context.Context) {
 	if executable == "" {
 		return
 	}
-	nodes, err := ParseFixedNodes(p.cfg.Nodes, p.cfg.PreferredDomains, p.cfg.Endpoints)
+	nodes, err := ParseFixedNodes(p.cfg.Nodes, p.cfg.PreferredDomains, p.cfg.Endpoints, p.cfg.EdgeIPs)
 	if err != nil {
 		return
 	}
@@ -553,7 +553,7 @@ func (p *Pool) run(ctx context.Context) {
 // network fetch, and a failing one degrades to the fixed nodes instead of
 // leaving the pool empty.
 func (p *Pool) candidates(ctx context.Context) ([]Node, []Node, error) {
-	fixed, err := ParseFixedNodes(p.cfg.Nodes, p.cfg.PreferredDomains, p.cfg.Endpoints)
+	fixed, err := ParseFixedNodes(p.cfg.Nodes, p.cfg.PreferredDomains, p.cfg.Endpoints, p.cfg.EdgeIPs)
 	if err != nil {
 		return nil, nil, err
 	}

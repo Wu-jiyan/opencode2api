@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"opencode2api/internal/config"
 	"opencode2api/internal/identity"
@@ -112,5 +113,51 @@ func TestAnonymousLaneAnswersFromRecordWhileEveryExitCools(t *testing.T) {
 	}
 	if string(replayed) != rateLimitBody {
 		t.Fatalf("replayed body = %q, want the recorded error document", replayed)
+	}
+}
+
+// A 403 from a pinned-source exit is the lane's own verdict: every such exit
+// shares one address block, so the request has to stop after a single attempt
+// and the refusal has to be kept for the requests that follow. Scanning the pool
+// on this answer is what produced the 12-184s latencies of 2026-10-14.
+func TestAnonymousLaneStopsOnPinnedExitRejection(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, freeTierRejectionBody)
+	}))
+	defer server.Close()
+
+	gateway := &Gateway{
+		cfg: config.Config{
+			Upstream: config.UpstreamConfig{Zen: server.URL},
+			Retry:    config.RetryConfig{MaxAttempts: 3, TimeoutSeconds: 30},
+		},
+		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		anonymous: newTestAnonymousPool(t, []string{"direct", "direct"}),
+	}
+	ids := identity.RequestIDs{Session: "ses_152a2b50b0014", Request: "msg_152a2b50b0014", Project: "global"}
+	bodies := map[config.Tier][]byte{config.TierZen: []byte(
+		`{"model":"space-bunny-free","stream":true,"messages":[{"role":"user","content":"hi"}]}`)}
+	route := models.Route{ID: "space-bunny-free", Tier: config.TierZen, Protocol: wire.Chat}
+
+	resp, err, attempts := gateway.doAnonymousUpstream(context.Background(), route, bodies, ids, 0)
+	if err != nil {
+		t.Fatalf("anonymous attempt failed: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want the scan to stop after the first pinned exit", attempts)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("upstream saw %d requests, want 1", got)
+	}
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+	if _, ok := gateway.anonymous.Refusal(time.Now()); !ok {
+		t.Fatal("a pinned exit's refusal must be recorded so later requests are answered from it")
 	}
 }

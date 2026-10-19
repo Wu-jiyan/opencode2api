@@ -232,7 +232,15 @@ func firstNonEmpty(values ...string) string {
 // Nodes whose address is a literal IP, or that match no preferred domain, are
 // taken as-is: a fixed link is a deliberate choice and must not be rewritten
 // into something the operator did not ask for.
-func ParseFixedNodes(links, preferredDomains, endpoints []string) ([]Node, error) {
+//
+// edgeIPs fans every surviving candidate out across a list of anycast edge
+// addresses. A Cloudflare-fronted worker answers on any address that serves its
+// zone, so the address in the share link is one entry point among thousands;
+// each extra address becomes an additional listener for the same worker, with
+// UUID, SNI, host, path and transport untouched. The expansion is ordered by
+// edge rather than by node, so a listener limit smaller than the full product
+// still covers every worker before doubling up on one of them.
+func ParseFixedNodes(links, preferredDomains, endpoints, edgeIPs []string) ([]Node, error) {
 	domains := make([]string, 0, len(preferredDomains))
 	for _, domain := range preferredDomains {
 		if value := strings.TrimSpace(domain); value != "" {
@@ -269,7 +277,32 @@ func ParseFixedNodes(links, preferredDomains, endpoints []string) ([]Node, error
 			out = append(out, applyEndpoint(clone, origins, len(out)))
 		}
 	}
-	return out, nil
+	return expandEdgeIPs(out, edgeIPs), nil
+}
+
+// expandEdgeIPs returns one candidate per (edge, link) pair. The edge is the
+// outer loop so consecutive candidates differ in both dimensions: with one link
+// the pool is simply the edge list, and with several links every edge is used
+// on every worker before any of them gets a second listener.
+func expandEdgeIPs(nodes []Node, edgeIPs []string) []Node {
+	edges := make([]string, 0, len(edgeIPs))
+	for _, edge := range edgeIPs {
+		if value := strings.TrimSpace(edge); value != "" {
+			edges = append(edges, value)
+		}
+	}
+	if len(edges) == 0 || len(nodes) == 0 {
+		return nodes
+	}
+	out := make([]Node, 0, len(nodes)*len(edges))
+	for _, edge := range edges {
+		for _, node := range nodes {
+			clone := node
+			clone.Address = edge
+			out = append(out, clone)
+		}
+	}
+	return out
 }
 
 // applyEndpoint points a candidate at one of the alternative origins, cycling

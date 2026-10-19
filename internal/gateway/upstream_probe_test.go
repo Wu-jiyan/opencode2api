@@ -114,3 +114,30 @@ func TestAnonymousLaneRefusal(t *testing.T) {
 		t.Fatal("a nil response must not be classified as a refusal")
 	}
 }
+
+// A refusal only speaks for the whole lane when the gateway owns the address
+// upstream saw. Pinned sources all sit in one block, so their verdict covers
+// every exit; a proxy exit reaches upstream through an egress the gateway does
+// not own, so the next exit may well succeed and the scan has to continue.
+func TestLaneLevelVerdict(t *testing.T) {
+	cases := []struct {
+		name  string
+		proxy string
+		want  bool
+	}{
+		{"direct exit uses the host's own address", "direct", true},
+		{"pinned IPv6 source", "ipv6://2602:f32a:3:6200::1000", true},
+		{"socks5 proxy exit", "socks5://127.0.0.1:24000", false},
+		{"http proxy exit", "http://user:pass@198.51.100.9:8080", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := laneLevelVerdict(&proxyTransport{name: tc.proxy}); got != tc.want {
+				t.Fatalf("laneLevelVerdict(%q) = %v, want %v", tc.proxy, got, tc.want)
+			}
+		})
+	}
+	if !laneLevelVerdict(nil) {
+		t.Fatal("a response without exit attribution must count as a lane-level verdict")
+	}
+}

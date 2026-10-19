@@ -375,6 +375,7 @@ unzip Xray-linux-64.zip xray && chmod +x xray && rm Xray-linux-64.zip
   "subscription": "https://你的订阅地址",
   "nodes": [],
   "preferred_domains": [],
+  "edge_ips": [],
   "endpoints": []
 }
 ```
@@ -386,8 +387,9 @@ unzip Xray-linux-64.zip xray && chmod +x xray && rm Xray-linux-64.zip
   "enabled": true,
   "subscription": "",
   "nodes": ["vless://uuid@ct.example.com:443?security=tls&sni=edn2.example.com&type=ws&host=edn2.example.com&path=%2F%3Fed%3D2560"],
-  "preferred_domains": ["cf.example.com", "ct.example.com", "cu.example.com"],
-  "endpoints": ["edn2.example.com", "edn3.example.com", "edn4.example.com"],
+  "preferred_domains": [],
+  "edge_ips": ["104.16.0.1", "104.19.0.1", "172.66.0.1", "188.114.96.1"],
+  "endpoints": [],
   "count": 7,
   "port_base": 24100
 }
@@ -397,11 +399,16 @@ unzip Xray-linux-64.zip xray && chmod +x xray && rm Xray-linux-64.zip
 | ------------------- | -------------------------------------------------------------- |
 | `nodes`             | 固定 `vless://` 链接，每行一条                                 |
 | `preferred_domains` | 入口域名，替换固定节点的入口地址，每个值生成一个候选           |
+| `edge_ips`          | 入口 IP 池（CF 优选 IP），每条固定链接按每个 IP 各生成一个候选 |
 | `endpoints`         | 服务入口，按候选序号轮流分配；只有 Host 与 SNI 会变，UUID 不变 |
 
-`preferred_domains` 与 `endpoints` 的区别：前者决定"从哪个边缘地址进场"（出口 IP由此变化），后者决定"落到哪个服务入口"（各入口通常各有请求额度）。地址是字面 IP 且不在 `preferred_domains` 中的节点会原样使用，不会被改写。
+**`edge_ips` 是 Cloudflare 前置节点的正确用法**：CF 按 SNI 路由，任意能服务该 zone 的边缘 IP 都是合法入口，所以一条 `vless://` 链接配合 N 个边缘 IP 就是 N 条独立隧道（N 个 listener，各自一个 Xray 进程）。扩展只改入口地址，UUID / SNI / Host / 路径 / 传输方式全部保持原样；顺序是"外层循环 IP、内层循环链接"，因此 `count` 小于全量乘积时仍然先覆盖每个 worker，而不是把槽位全给第一个。上限 64 个地址，且每项必须是字面 IP（写域名会直接报错，避免被误当成"节点不稳"）。
 
-端口按候选数规划即可 —— 用固定节点时 `count` 建议设成 `preferred_domains` 的长度，多出来的槽位没有候选可用。固定节点候选会按实测延迟排序，快的占用靠前槽位，连不上的排最后而不是被丢弃，以免池子缩到小于 `count`。
+用 `tools/cf_ip_scan.py --apply` 可以把扫描 + 长连接存活测试通过的地址直接写进 `edge_ips`（它同时会做 150 秒长连接存活测试，这一项很关键：边缘 IP 能握手不代表能撑住 SSE 长连接）。
+
+`preferred_domains` 与 `endpoints` 的区别：前者决定"从哪个边缘地址进场"（出口 IP由此变化），后者决定"落到哪个服务入口"（各入口通常各有请求额度）。地址是字面 IP 且不在 `preferred_domains` 中的节点会原样使用，不会被改写。`edge_ips` 在两者之后应用，最终入口地址以它为准。
+
+端口按候选数规划即可：`count` 建议设成实际可用的候选数（固定节点 × `edge_ips`，上限还受 `count` 约束），多出来的槽位没有候选可用。固定节点候选会按实测延迟排序，快的占用靠前槽位，连不上的排最后而不是被丢弃，以免池子缩到小于 `count`。
 
 ### 端口规划
 
@@ -559,7 +566,12 @@ seq 1 120 | xargs -P 40 -I{} curl -s -o /dev/null -w '%{http_code}\n' --max-time
 
 **排查手法（这次就是这么定位的）**：不要只盯着请求头猜。**对照真客户端**最快——让 `opencode run -m opencode/<免费模型> ...` 走同一出口成功一次，再把它抓到的请求逐字节回放，逐步淘汰到只剩一个变量。另外注意 `/zen/v1/models` 这类 GET 仍正常，别据此认为整条 `/zen` 路由还活着。
 
-**403 不能重试**：匿名层只有一个身份（共享 `public` 凭证 + 一套客户端指纹），换出口不会改变判定。`v1.3.2` 起网关遇到 `403 FreeTierError` 立即停止扫描出口池，并记为 `anonymous_identity_rejected`。旧版本会把一次 403 放大成整池尝试——客户端延迟涨到 12–184 秒。看到这种「403 却要好几分钟才返回」的形态，直接升级即可。
+**403 是"谁说了算"的问题**：匿名层只有一个身份（共享 `public` 凭证 + 一套客户端指纹），但**出口的源地址归谁所有**决定了这条 403 是否代表整条通道：
+
+- **源地址是我们的**（`ipv6://` 钉死源地址、`direct` 直连）：所有这类出口落在同一段地址里，换出口只会拿到同一个 403。`v1.3.2` 起遇到 `403 FreeTierError` **立即停止扫描**并记为 `anonymous_identity_rejected`；旧版本会把一次 403 放大成整池尝试——客户端延迟涨到 12–184 秒。
+- **源地址不是我们的**（`socks5://` / `http://` 代理出口，例如 CF Workers 节点）：上游看到的是**代理出口的 egress**，那条 403 是这个 egress 自己的答复，换下一条 listener 很可能就成功。`v1.3.8` 起这类出口遇 403 **继续轮换**（记 `anonymous_exit_refused`，Debug 级），也不会把它记成整条通道的拒绝——否则一条坏出口会把整池有能力的出口一起判死。
+
+判断出口属于哪一类不需要你配置：网关按出口名自动区分（`ipv6://`、`direct` 归第一类，带 scheme 的代理归第二类）。所以「403 却要好几分钟才返回」仍然是需要升级的信号，而「CF 节点偶发 403」不再意味着整个池子停摆。
 
 **处理**：升级到最新版本。自检（应为 `200` 而不是 `403`）：
 
@@ -587,7 +599,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $SERVER_KEY" 
 
 **`v1.3.6` 起的行为**：额度耗尽时，网关不再每个请求都去戳一次上游。匿名通道会记住最近一次针对整条通道的拒绝（`429`，或 `403 FreeTierError`），当**所有出口都在冷却**时直接用这条记录作答——状态码、错误文案、以及倒数到同一截止时刻的 `Retry-After` 全部与真答复一致。日志中：
 
-- `anonymous_lane_refused`：学到窗口时记一次，带 `status` / `retry_after` / `proxy`；
+- `anonymous_lane_refused`：学到窗口时记一次，带 `status` / `retry_after` / `proxy`（只有源地址属于我们的出口才会记，见上节）；
 - `anonymous_refusal_replayed`：每次由记录作答记一次（`Debug` 级，默认 `info` 下不可见）；
 - 记录只由**被正常服务的推理请求**清除，**目录刷新成功不算**：目录路由在推理被限流时照样返回 200，若让它清除记录，每 5 分钟一次的目录刷新都会把记录清掉，让下一个请求再去探一次；
 - 否则它在上游给出的时刻自然过期。**恢复不需要任何人工干预**，但要等 UTC 零点。
