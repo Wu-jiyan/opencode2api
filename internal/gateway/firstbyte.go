@@ -52,6 +52,12 @@ func (f *firstByteDeadline) Read(p []byte) (int, error) {
 		copy(p, buf[:result.n])
 		return result.n, result.err
 	case <-timer.C:
+		// Release the connection before giving up on the read. The read below may
+		// still be parked in the transport, and the caller drains the body when it
+		// abandons the attempt: without this the drain would wait for a body that
+		// never ends, and the request would keep burning its budget on the very
+		// attempt it just gave up on.
+		go func() { _ = f.ReadCloser.Close() }()
 		return 0, errUpstreamStalled
 	}
 }

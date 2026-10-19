@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -140,5 +141,44 @@ func TestFirstByteDeadlineDisabledLeavesTheBody(t *testing.T) {
 	body := io.NopCloser(strings.NewReader("x"))
 	if guarded := withFirstByteDeadline(body, 0); guarded != body {
 		t.Fatal("a disabled watch dog must not wrap the body")
+	}
+}
+
+// closeTrackingBody blocks in Read until it is closed, the way a body whose
+// upstream never sends anything behaves.
+type closeTrackingBody struct {
+	closed atomic.Bool
+	once   sync.Once
+}
+
+func (b *closeTrackingBody) Read([]byte) (int, error) {
+	for !b.closed.Load() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	return 0, io.EOF
+}
+
+func (b *closeTrackingBody) Close() error {
+	b.once.Do(func() { b.closed.Store(true) })
+	return nil
+}
+
+// The abandoned attempt must not hold its connection: the caller drains the body
+// when it gives up, and a drain on a body that never ends waits for the whole
+// request budget. That is what made the first-byte watch dog detect the stall in
+// 3 seconds and then still hold the request for 60 (measured 2026-10-19).
+func TestFirstByteDeadlineClosesTheBodyOnStall(t *testing.T) {
+	body := &closeTrackingBody{}
+	guarded := withFirstByteDeadline(body, 50*time.Millisecond)
+
+	if _, err := guarded.Read(make([]byte, 32)); !errors.Is(err, errUpstreamStalled) {
+		t.Fatalf("read error = %v, want errUpstreamStalled", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !body.closed.Load() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !body.closed.Load() {
+		t.Fatal("a stalled body must be closed, or the abandoned attempt keeps the request waiting")
 	}
 }
