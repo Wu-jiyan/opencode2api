@@ -152,40 +152,43 @@ func TestDeprecatedZeroCostModelIsStillMetadataFree(t *testing.T) {
 	}
 }
 
-// The published endpoint tables can declare a model the machine catalog does not
-// list. Those IDs are addressable even though the advertised list must keep
-// showing only what upstream enumerates: measured 2026-10-19, cat-jam-free
-// answers 200 while /inference/v1/models omits it, so requiring a listing made a
-// working model unreachable behind a misleading "protocol not exposed" error.
-func TestDocumentedButUnlistedFreeModelIsRoutable(t *testing.T) {
+// The capability catalog describes more models than upstream lists in /models.
+// Those IDs stay addressable even though the advertised list must keep showing
+// only the listed set: measured 2026-10-19, cat-jam-free answers 200 while
+// /inference/v1/models omits it, so requiring a listing made a working model
+// unreachable behind a misleading "protocol not exposed" error.
+func TestDescribedButUnlistedFreeModelIsRoutable(t *testing.T) {
 	catalog := NewCatalog(config.TierZen, nil)
 	catalog.ReplaceWithCapabilities(
 		[]string{"space-bunny-free"},
-		nil, nil, nil, nil,
+		nil,
+		// The machine catalog describes the model with its protocol; the listing
+		// above does not contain it.
 		map[config.Tier]map[string]wire.Protocol{config.TierZen: {"cat-jam-free": wire.Chat}},
+		nil, nil, nil,
 	)
 
 	route, err := catalog.Route("cat-jam-free", false, false, true)
 	if err != nil {
-		t.Fatalf("a documented free model must be routable: %v", err)
+		t.Fatalf("a described free model must be routable: %v", err)
 	}
 	if !route.Anonymous || route.Tier != config.TierZen {
 		t.Fatalf("route = %+v, want the anonymous Zen lane", route)
 	}
 	if route.Protocol != wire.Chat {
-		t.Fatalf("protocol = %q, want the documented chat", route.Protocol)
+		t.Fatalf("protocol = %q, want the declared chat", route.Protocol)
 	}
 	if !catalog.Supported("cat-jam-free") {
-		t.Fatal("a documented model must not be reported as an unsupported protocol")
+		t.Fatal("a described model must not be reported as an unsupported protocol")
 	}
 	if !catalog.Known("cat-jam-free") {
-		t.Fatal("a documented model must count as known")
+		t.Fatal("a described model must count as known")
 	}
 	// It must stay out of the advertised list: the client should enumerate what
-	// upstream lists, not every id a document happens to mention.
+	// upstream lists, not every id the capability catalog happens to describe.
 	for _, id := range catalog.List() {
 		if id == "cat-jam-free" {
-			t.Fatal("a documented-but-unlisted model must not be advertised")
+			t.Fatal("a described-but-unlisted model must not be advertised")
 		}
 	}
 }

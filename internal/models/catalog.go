@@ -241,13 +241,14 @@ func (c *Catalog) routeLocked(model string, hasZenKeys, hasGoKeys, hasAnonymous 
 	// there, even if the current catalog only advertises it on Go: an upstream
 	// rejection will move the request into the authenticated fallback plan.
 	decision := c.anonymousDecision(model)
-	// A published endpoint table can declare a model the machine catalog does not
-	// list. Those IDs are addressable even though enumerating /v1/models must keep
-	// showing only what upstream lists: measured 2026-10-19, cat-jam-free answers
-	// 200 while /inference/v1/models omits it, so requiring a listing here made a
-	// working model unreachable.
+	// The capability catalog describes more models than upstream lists in
+	// /models. Those IDs are addressable even though enumerating must keep
+	// showing only the listed set: measured 2026-10-19 the machine catalog
+	// described 123 Zen models while /inference/v1/models listed 85, and
+	// cat-jam-free — described but unlisted — answered 200. Requiring a listing
+	// here made a working model unreachable.
 	if hasAnonymous && decision.Allowed && (c.protocols[model] != "" || !c.unsupported[config.TierZen][model]) &&
-		(len(c.zen) == 0 && len(c.goModels) == 0 || c.zen[model] || c.goModels[model] || c.documentedLocked(model)) {
+		(len(c.zen) == 0 && len(c.goModels) == 0 || c.zen[model] || c.goModels[model] || c.declaredLocked(model)) {
 		protocols := c.protocolsForLocked(model, keyTiers, true)
 		return Route{ID: model, Tier: config.TierZen, Protocol: protocols[config.TierZen], Protocols: protocols, Anonymous: true, KeyTiers: keyTiers}, nil
 	}
@@ -496,24 +497,27 @@ func (c *Catalog) supportedLocked(model string) bool {
 	if len(c.zen) == 0 && len(c.goModels) == 0 {
 		return true
 	}
-	// A documented model is servable, which is why it is not reported as an
-	// unsupported protocol; see documentedLocked.
-	if (c.zen[model] || c.docs[config.TierZen][model] != "") && c.tierSupportedLocked(model, config.TierZen) {
+	// A described model is servable, which is why it is not reported as an
+	// unsupported protocol; see declaredLocked.
+	if (c.zen[model] || c.nativeProtocols[config.TierZen][model] != "") && c.tierSupportedLocked(model, config.TierZen) {
 		return true
 	}
-	if (c.goModels[model] || c.docs[config.TierGo][model] != "") && c.tierSupportedLocked(model, config.TierGo) {
+	if (c.goModels[model] || c.nativeProtocols[config.TierGo][model] != "") && c.tierSupportedLocked(model, config.TierGo) {
 		return true
 	}
 	return false
 }
 
-// documentedLocked reports whether the published endpoint tables declare the
-// model. Those tables are the one place a model exists without appearing in the
-// machine catalog's listing, so a caller can address it while /v1/models still
-// shows only what upstream enumerates.
-func (c *Catalog) documentedLocked(model string) bool {
+// declaredLocked reports whether the capability catalog describes the model,
+// even when upstream does not list it in /models. The two sets differ: the
+// machine catalog is a superset that keeps retired and not-yet-listed entries,
+// and a model described there can still answer — cat-jam-free did, while
+// /inference/v1/models omitted it (measured 2026-10-19). Addressing such a model
+// has to keep working; enumerating /v1/models must keep showing only the listed
+// set, which is why this is not treated as availability.
+func (c *Catalog) declaredLocked(model string) bool {
 	for _, tier := range []config.Tier{config.TierZen, config.TierGo} {
-		if c.docs[tier][model] != "" {
+		if c.nativeProtocols[tier][model] != "" {
 			return true
 		}
 	}
@@ -535,15 +539,7 @@ func (c *Catalog) knownLocked(model string) bool {
 		// the caller for our own empty catalog.
 		return true
 	}
-	if c.zen[model] || c.goModels[model] || c.documentedLocked(model) {
-		return true
-	}
-	for _, tier := range []config.Tier{config.TierZen, config.TierGo} {
-		if c.nativeProtocols[tier][model] != "" {
-			return true
-		}
-	}
-	return false
+	return c.zen[model] || c.goModels[model] || c.declaredLocked(model)
 }
 
 func (c *Catalog) tierSupportedLocked(model string, tier config.Tier) bool {
