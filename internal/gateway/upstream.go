@@ -228,6 +228,23 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	// downstream client asked for a plain JSON reply. Key tiers keep their
 	// original bodies.
 	body = prepareAnonymousBody(body, route.ProtocolFor(config.TierZen))
+	// A refusal from a proxy exit only speaks for that exit, so the lane rotates
+	// past it. When every exit has refused and the whole pool is cooling there is
+	// nothing left to rotate onto: at that point the refusal has described every
+	// exit we can reach, and promoting it to a lane-level refusal is what stops
+	// the pool from probing once per request for as long as the condition lasts —
+	// the shape that cost ~379k pointless upstream requests during the 2026-10-15
+	// quota outage.
+	var lastRefusal *anonymousRefusal
+	promoteRefusal := func() {
+		if lastRefusal == nil || !g.anonymous.FullyCooling(time.Now()) {
+			return
+		}
+		if g.anonymous.RecordRefusal(time.Now(), lastRefusal.status, lastRefusal.retryAfter, lastRefusal.body) {
+			g.logger.Warn("anonymous lane refused by every exit; backing off", "component", "upstream", "event", "anonymous_lane_exhausted", "request_id", ids.Request, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "status", lastRefusal.status, "retry_after", lastRefusal.retryAfter, "exits", limit)
+		}
+		lastRefusal = nil
+	}
 	for attempts < limit {
 		now := time.Now()
 		if ctx.Err() != nil {
@@ -324,6 +341,8 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				g.logger.Warn("anonymous lane refused by upstream", "component", "upstream", "event", "anonymous_lane_refused", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "status", refusal.status, "retry_after", refusal.retryAfter, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds())
 			}
 		} else if laneRefusal {
+			held := refusal
+			lastRefusal = &held
 			g.logger.Debug("exit refused the request; rotating to another egress", "component", "upstream", "event", "anonymous_exit_refused", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "status", refusal.status, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds())
 		}
 		if isNonRetryableClientResponse(resp, err) {
@@ -346,6 +365,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			g.logger.Debug("anonymous upstream returned an error response; trying the next proxy", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
 		}
 	}
+	promoteRefusal()
 	if lastResponse != nil {
 		return lastResponse, nil, attempts
 	}

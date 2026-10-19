@@ -161,3 +161,72 @@ func TestAnonymousLaneStopsOnPinnedExitRejection(t *testing.T) {
 		t.Fatal("a pinned exit's refusal must be recorded so later requests are answered from it")
 	}
 }
+
+// A refusal from a proxy exit only speaks for that exit, so the first request
+// rotates through the pool. Once every exit has refused and the pool is cooling,
+// rotating has nothing left to reach: the refusal becomes lane-level and later
+// requests are answered from it instead of probing once per request — the shape
+// that cost ~379k pointless upstream requests during the 2026-10-15 outage.
+func TestAnonymousLaneBacksOffWhenEveryProxyExitRefuses(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Count only the inference requests: the proxy health check that follows
+		// a 4xx also lands on this server, and it is not a lane attempt.
+		if r.URL.Path == "/v1/chat/completions" {
+			hits.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, freeTierRejectionBody)
+	}))
+	defer server.Close()
+
+	// The pool entries are proxy URLs, not pinned sources: laneLevelVerdict is
+	// false for them, so the lane rotates instead of stopping on the first 403.
+	gateway := &Gateway{
+		cfg: config.Config{
+			Upstream: config.UpstreamConfig{Zen: server.URL},
+			Retry:    config.RetryConfig{MaxAttempts: 3, TimeoutSeconds: 30},
+		},
+		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		anonymous: newTestAnonymousPool(t, []string{server.URL, server.URL}),
+	}
+	ids := identity.RequestIDs{Session: "ses_152a2b50b0015", Request: "msg_152a2b50b0015", Project: "global"}
+	bodies := map[config.Tier][]byte{config.TierZen: []byte(
+		`{"model":"space-bunny-free","stream":true,"messages":[{"role":"user","content":"hi"}]}`)}
+	route := models.Route{ID: "space-bunny-free", Tier: config.TierZen, Protocol: wire.Chat}
+
+	first, err, attempts := gateway.doAnonymousUpstream(context.Background(), route, bodies, ids, 0)
+	if err != nil {
+		t.Fatalf("first anonymous attempt failed: %v", err)
+	}
+	if first.StatusCode != http.StatusForbidden {
+		t.Fatalf("first status = %d, want %d", first.StatusCode, http.StatusForbidden)
+	}
+	if attempts != 2 {
+		t.Fatalf("first attempt count = %d, want both proxy exits tried once", attempts)
+	}
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("upstream saw %d requests, want 2: one per proxy exit", got)
+	}
+	_ = first.Body.Close()
+
+	if _, ok := gateway.anonymous.Refusal(time.Now()); !ok {
+		t.Fatal("a refusal from every exit must be promoted to a lane-level refusal")
+	}
+
+	second, err, attempts := gateway.doAnonymousUpstream(context.Background(), route, bodies, ids, 0)
+	if err != nil {
+		t.Fatalf("second anonymous attempt failed: %v", err)
+	}
+	defer func() { _ = second.Body.Close() }()
+	if attempts != 0 {
+		t.Fatalf("second attempt count = %d, want it answered from the record", attempts)
+	}
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("upstream saw %d requests, want no further probe once every exit refused", got)
+	}
+	if second.StatusCode != http.StatusForbidden {
+		t.Fatalf("second status = %d, want the recorded %d", second.StatusCode, http.StatusForbidden)
+	}
+}
