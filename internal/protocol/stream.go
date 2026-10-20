@@ -256,6 +256,15 @@ func ForwardStream(ctx context.Context, w http.ResponseWriter, reader io.Reader,
 	if !wrote && !finalAttempt {
 		return usage, restartableStreamError(cause)
 	}
+	// A stream that forwarded framing only — the role chunk, identifiers,
+	// usage — has given the client nothing it could not receive again, so the
+	// turn can still be replayed on another exit. The upstream drops these
+	// connections right after it opens the stream; reporting that as an error
+	// would hand the client a broken turn for a request that never produced
+	// anything.
+	if observer.CanReplayAfterFraming() && !finalAttempt {
+		return usage, restartableStreamError(cause)
+	}
 	emitter := newBridgeStreamEmitter(w, flusher, protocol, model)
 	if err := emitUnexpectedStreamError(emitter, cause); err != nil {
 		return usage, err
@@ -345,13 +354,39 @@ type streamUsageObserver struct {
 	normal   bool
 	error    bool
 	parseErr error
+	// answerPending records that the stream has not produced the answer yet.
+	// The upstream opens a turn with the role, the identifiers and often a
+	// first stretch of reasoning text; none of that is the answer, and a
+	// connection that dies there can still be replayed on another exit.
+	//
+	// Reasoning alone does not end the state: the thinking of a cut attempt
+	// may reach the client a second time, but a turn that completes is worth
+	// more than one that fails. A frame that cannot be read with confidence
+	// does end it: nothing about an unknown frame says it carried no answer.
+	answerPending bool
+	// framed records that at least one complete frame was seen. A stream that
+	// never delivered a whole frame was cut mid-record, and nothing about it
+	// says the record held no text.
+	framed bool
+	// relaxReplay marks the protocols where a replay may repeat framing the
+	// client already received. Chat qualifies: the repeated frame carries a
+	// role and no content, and clients ignore it. Responses and Anthropic do
+	// not: their framing carries identifiers a client would see twice.
+	relaxReplay bool
 }
 
 func newStreamUsageObserver(protocol Protocol) *streamUsageObserver {
 	return &streamUsageObserver{parser: &bridgeStreamParser{
 		protocol: protocol, tools: map[string]bool{}, toolIDs: map[string]string{}, toolNames: map[string]string{},
 		responseArgs: map[string]bool{}, responseReasoning: map[string]bool{},
-	}}
+	}, answerPending: true, relaxReplay: protocol == Chat}
+}
+
+// CanReplayAfterFraming reports whether a stream that forwarded framing only
+// may still be replayed: the client received nothing it would miss, and the
+// protocol tolerates the repeated framing.
+func (observer *streamUsageObserver) CanReplayAfterFraming() bool {
+	return observer.relaxReplay && observer.framed && observer.answerPending
 }
 
 // streamFrameMarkers are the only byte patterns that can change what the
@@ -387,7 +422,10 @@ func (observer *streamUsageObserver) Write(data []byte) (int, error) {
 		// The frame is consumed before the buffer is re-sliced, so it never
 		// escapes; copying it would add an allocation per upstream chunk.
 		frame := observer.buffer[:index+width]
-		if interestingStreamFrame(frame) {
+		// While the stream has carried framing only, every frame is read to
+		// learn whether it produced text. Once text has been seen the cheap
+		// marker test is enough again.
+		if observer.answerPending || interestingStreamFrame(frame) {
 			observer.consume(frame)
 		}
 		observer.buffer = observer.buffer[index+width:]
@@ -409,12 +447,20 @@ func (observer *streamUsageObserver) ErrorTermination() bool { return observer.e
 func (observer *streamUsageObserver) ParseError() error { return observer.parseErr }
 
 func (observer *streamUsageObserver) consume(frame []byte) {
+	observer.framed = true
 	_ = readSSE(bytes.NewReader(frame), func(eventName, data string) error {
 		events, err := observer.parser.Parse(eventName, data)
 		if err != nil {
 			if observer.parseErr == nil {
 				observer.parseErr = err
 			}
+			// A frame the parser rejects says nothing about its content.
+			observer.answerPending = false
+			return nil
+		}
+		if len(events) == 0 {
+			// An unrecognized frame: nothing about it says it carried no answer.
+			observer.answerPending = false
 			return nil
 		}
 		for _, event := range events {
@@ -423,6 +469,12 @@ func (observer *streamUsageObserver) consume(frame []byte) {
 				observer.normal = true
 			case "error":
 				observer.error = true
+			}
+			switch event.Kind {
+			case "text", "tool_start", "tool_delta":
+				if event.Text != "" || event.ToolKey != "" {
+					observer.answerPending = false
+				}
 			}
 			if event.Usage != nil {
 				mergeBridgeUsage(&observer.usage, *event.Usage)
