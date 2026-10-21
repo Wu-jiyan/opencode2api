@@ -23,7 +23,7 @@ The management console is embedded in the executable, so running the service req
 
 ## Quick start
 
-Download a binary from [GitHub Releases](https://github.com/wu-jiyan/opencode2api/releases), or build with **Go 1.24 or newer**:
+Download a binary from [GitHub Releases](https://github.com/wu-jiyan/opencode2api/releases), or build with **Go 1.27.3 or newer**. An older local toolchain is switched automatically to the required one via GOTOOLCHAIN:
 
 ```bash
 git clone https://github.com/wu-jiyan/opencode2api.git
@@ -600,7 +600,7 @@ npm run format
 npm run format:check
 ```
 
-`.editorconfig`, `.gitattributes`, Go formatting, and pinned Prettier settings standardize the source. CI runs `go vet` and builds with Go 1.24 and stable Go on Linux/Windows, plus formatting checks, a WebUI build, and entrypoint shell syntax checks. Release archives include both READMEs.
+`.editorconfig`, `.gitattributes`, Go formatting, and pinned Prettier settings standardize the source. CI runs `go vet` and builds with Go 1.27 and stable Go on Linux/Windows, plus formatting checks, a WebUI build, and entrypoint shell syntax checks. `govulncheck` runs on every push and blocks releases that ship reachable vulnerabilities. Release archives include both READMEs.
 
 ## Troubleshooting
 

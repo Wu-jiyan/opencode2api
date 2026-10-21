@@ -175,7 +175,9 @@ sudo journalctl -u opencode2api -f
 
 ## 方式二：从源码编译
 
-需要 **Go 1.24 或更高版本**。
+需要 **Go 1.27.3 或更高版本**。
+
+`1.27.3` 是 2026-10-21 安全修复（GO-2026-6809 / CVE-2026-111943，`crypto/x509` 中间 CA 黑名单）之后 1.27 分支的第一个版本；1.26 分支的对应修复版本是 `1.26.10`；Go 1.24 / 1.25 已停止维护，不会再收到安全修复。
 
 ```bash
 git clone https://github.com/Wu-jiyan/opencode2api.git

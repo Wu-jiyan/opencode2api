@@ -23,7 +23,7 @@
 
 ## 快速开始
 
-从 [GitHub Releases](https://github.com/wu-jiyan/opencode2api/releases) 下载二进制文件，或使用 **Go 1.24 及以上版本**编译：
+从 [GitHub Releases](https://github.com/wu-jiyan/opencode2api/releases) 下载二进制文件，或使用 **Go 1.27.3 及以上版本**编译。本地工具链版本较低时，Go 会通过 GOTOOLCHAIN 自动切换到所需版本：
 
 ```bash
 git clone https://github.com/wu-jiyan/opencode2api.git
@@ -604,7 +604,7 @@ npm run format
 npm run format:check
 ```
 
-项目通过 `.editorconfig`、`.gitattributes`、Go 格式化与固定版本的 Prettier 统一格式。CI 覆盖 Linux / Windows 上 Go 1.24 与稳定版 Go 的 `go vet` 和构建，以及格式检查、管理端构建和 shell 脚本语法检查。发布压缩包包含中英文两份 README。
+项目通过 `.editorconfig`、`.gitattributes`、Go 格式化与固定版本的 Prettier 统一格式。CI 覆盖 Linux / Windows 上 Go 1.27 与稳定版 Go 的 `go vet` 和构建，以及格式检查、管理端构建和 shell 脚本语法检查。每次推送都会跑 `govulncheck`，存在可达漏洞时直接阻断发布。发布压缩包包含中英文两份 README。
 
 ## 常见问题
 
