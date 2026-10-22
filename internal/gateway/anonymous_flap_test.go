@@ -180,3 +180,136 @@ func TestAnonymousRecordedRefusalStillStopsTheWalk(t *testing.T) {
 		t.Fatalf("attempts = %d, upstream hits = %d, want the record replayed without a probe", attempts, hits.Load())
 	}
 }
+
+// endpointUnavailableBody is what upstream answered on 2026-10-22 for a model
+// whose endpoint was momentarily unavailable while the same exits kept serving
+// other models.
+const endpointUnavailableBody = `{"type":"error","error":{"type":"EndpointUnavailable","message":"Upstream request failed: Endpoint is unavailable."}}`
+
+// A 402 "Endpoint is unavailable" is upstream speaking about that model right
+// now, not about the request we sent: the next exit is a different connection
+// and can serve it. Classifying it as a request-shape rejection ended the walk
+// after a single attempt, which is how a three-minute free-tier flap reached the
+// client as a run of 402s.
+func TestAnonymousLaneRotatesPastPaymentRequired(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if hits.Add(1) == 1 {
+			w.WriteHeader(http.StatusPaymentRequired)
+			_, _ = io.WriteString(w, endpointUnavailableBody)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"chatcmpl_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	}))
+	defer server.Close()
+
+	gateway := &Gateway{
+		cfg: config.Config{
+			Upstream: config.UpstreamConfig{Zen: server.URL},
+			Retry:    config.RetryConfig{MaxAttempts: 3, TimeoutSeconds: 30},
+		},
+		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		anonymous: newTestAnonymousPool(t, []string{"direct", "direct"}),
+	}
+	for _, node := range gateway.anonymous.nodes {
+		node.proxy.checking.Store(true)
+	}
+
+	ids := identity.RequestIDs{Session: "ses_16c1e0f5b0016", Request: "msg_16c1e0f5b0016", Project: "global"}
+	bodies := map[config.Tier][]byte{config.TierZen: []byte(
+		`{"model":"minimax-m3.1-flash-free","stream":true,"messages":[{"role":"user","content":"hi"}]}`)}
+	route := models.Route{ID: "minimax-m3.1-flash-free", Tier: config.TierZen, Protocol: wire.Chat}
+
+	resp, err, attempts := gateway.doAnonymousUpstream(context.Background(), route, bodies, ids, 0)
+	if err != nil {
+		t.Fatalf("walking past a 402 failed: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("no response after walking past a 402")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want the next exit's 200: a 402 must not end the walk", resp.StatusCode)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2 (the 402 exit, then the serving exit)", attempts)
+	}
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("upstream saw %d requests, want 2", got)
+	}
+}
+
+// A 402 must not take the exit out of service either: the status names the
+// endpoint's current state, so cooling every exit that reported it would turn
+// one model's flap into a pool-wide cooldown.
+func TestPaymentRequiredDoesNotCoolTheExit(t *testing.T) {
+	pool := newTestAnonymousPool(t, []string{"direct", "direct"})
+	node := pool.nodes[0]
+	pool.MarkFailure(node, &http.Response{StatusCode: http.StatusPaymentRequired}, nil)
+	if until := node.cooldownUntil.Load(); until != 0 {
+		t.Fatalf("a 402 cooled the exit for %v", time.Until(time.Unix(0, until)))
+	}
+	if got := node.failures.Load(); got != 0 {
+		t.Fatalf("failure counter = %d, want 0", got)
+	}
+}
+
+// Rotating past one 402 recovers a single flaky exit, but a second identical
+// verdict from a different exit is upstream describing the model, and the rest
+// of the pool can only repeat it. Walking all 16 exits took 64.5s on 2026-10-22
+// before the client heard what the first two had already said, so the walk stops
+// after paymentRequiredAttempts.
+func TestAnonymousLaneStopsWalkingAfterTwoPayments(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = io.WriteString(w, endpointUnavailableBody)
+	}))
+	defer server.Close()
+
+	gateway := &Gateway{
+		cfg: config.Config{
+			Upstream: config.UpstreamConfig{Zen: server.URL},
+			Retry:    config.RetryConfig{MaxAttempts: 3, TimeoutSeconds: 30},
+		},
+		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		anonymous: newTestAnonymousPool(t, []string{"direct", "direct", "direct"}),
+	}
+	for _, node := range gateway.anonymous.nodes {
+		node.proxy.checking.Store(true)
+	}
+
+	ids := identity.RequestIDs{Session: "ses_16c1e0f5b0017", Request: "msg_16c1e0f5b0017", Project: "global"}
+	bodies := map[config.Tier][]byte{config.TierZen: []byte(
+		`{"model":"longcat-2.5-preview-free","stream":true,"messages":[{"role":"user","content":"hi"}]}`)}
+	route := models.Route{ID: "longcat-2.5-preview-free", Tier: config.TierZen, Protocol: wire.Chat}
+
+	resp, err, attempts := gateway.doAnonymousUpstream(context.Background(), route, bodies, ids, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("no response")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPaymentRequired {
+		t.Fatalf("status = %d, want the upstream 402 handed back", resp.StatusCode)
+	}
+	if attempts != paymentRequiredAttempts {
+		t.Fatalf("attempts = %d, want %d: a repeated 402 must not walk the whole pool", attempts, paymentRequiredAttempts)
+	}
+	if got := hits.Load(); got != int32(paymentRequiredAttempts) {
+		t.Fatalf("upstream saw %d requests, want %d", got, paymentRequiredAttempts)
+	}
+}

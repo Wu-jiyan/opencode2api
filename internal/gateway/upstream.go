@@ -236,6 +236,9 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	// the shape that cost ~379k pointless upstream requests during the 2026-10-15
 	// quota outage.
 	var lastRefusal *anonymousRefusal
+	// paymentStops counts exits that answered 402 for this request; see
+	// paymentRequiredAttempts.
+	paymentStops := 0
 	promoteRefusal := func() {
 		if lastRefusal == nil || !g.anonymous.FullyCooling(time.Now()) {
 			return
@@ -358,6 +361,14 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		if isNonRetryableClientResponse(resp, err) {
 			g.logger.Debug("anonymous upstream rejected a non-retryable request", "component", "upstream", "event", "anonymous_attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "status", resp.StatusCode, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds())
 			return resp, nil, attempts
+		}
+
+		if resp != nil && resp.StatusCode == http.StatusPaymentRequired {
+			paymentStops++
+			if paymentStops >= paymentRequiredAttempts {
+				g.logger.Debug("anonymous upstream answered 402 again; the model endpoint is unavailable", "component", "upstream", "event", "anonymous_payment_required_walk_stopped", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "status", resp.StatusCode, "stops", paymentStops, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds())
+				return resp, nil, attempts
+			}
 		}
 		// A free-tier identity rejection arrives as 403, which the check above
 		// deliberately lets rotate for the authenticated tiers. For the anonymous
@@ -911,9 +922,51 @@ func newUpstreamRequest(ctx context.Context, baseURL string, protocol wire.Proto
 	return req, nil
 }
 
+// isNonRetryableClientResponse reports whether an upstream answer speaks about
+// the request itself rather than about the endpoint's ability to serve it now.
+//
+// Only a request-shape rejection is deterministic: every exit and every key
+// would answer it identically, so rotating buys one tunnel and TLS handshake per
+// remaining exit before the client hears the same thing. A status that names the
+// endpoint or the credential instead answers a question a different exit can
+// answer differently, so it stays retryable: 401 (this credential), 402 (this
+// endpoint is out of credit or unavailable), 403 (this identity), 429 (this
+// caller's rate) and every 5xx.
+//
+// 402 sat on the wrong side of that line. On 2026-10-22 upstream answered one
+// model with
+//
+//	402 {"error":{"message":"Upstream request failed: Endpoint is unavailable."}}
+//
+// while other models on the same exits kept serving. Because 402 counted as a
+// request-shape rejection, the first such answer ended the whole exit walk, so a
+// transient free-tier flap reached the client as a run of 402s that repeating
+// the request seconds later served normally. A payment status is not a statement
+// about the request, and it carries no verdict about the exit either: neither
+// pool cools on it, which is what makes rotating past it free of state damage.
 func isNonRetryableClientResponse(resp *http.Response, err error) bool {
-	return err == nil && resp != nil && resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests
+	if err != nil || resp == nil {
+		return false
+	}
+	if resp.StatusCode < 400 || resp.StatusCode >= 500 {
+		return false
+	}
+	switch resp.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests, http.StatusPaymentRequired:
+		return false
+	}
+	return true
 }
+
+// paymentRequiredAttempts bounds how many exits a 402 may cost.
+//
+// A 402 from one exit names the model endpoint, not the exit, so rotating past
+// the first one is what recovers a single flaky exit. A second identical verdict
+// from a different exit is upstream describing the model, and the remaining
+// exits can only repeat it: measured on 2026-10-22, an unavailable (deprecated)
+// model walked all 16 exits and took 64.5s before the client was told what the
+// first two had already said. Two attempts keep the recovery and cap the cost.
+const paymentRequiredAttempts = 2
 
 // freeTierRejectionMarker identifies the error upstream returns when it decides
 // a request did not come from the official client.
