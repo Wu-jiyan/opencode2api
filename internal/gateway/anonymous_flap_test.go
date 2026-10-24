@@ -2,12 +2,14 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -311,5 +313,238 @@ func TestAnonymousLaneStopsWalkingAfterTwoPayments(t *testing.T) {
 	}
 	if got := hits.Load(); got != int32(paymentRequiredAttempts) {
 		t.Fatalf("upstream saw %d requests, want %d", got, paymentRequiredAttempts)
+	}
+}
+
+// freeUsageLimitBody is what upstream answers once the free tier's shared budget
+// for the lane's "public" credential is spent. Captured 2026-10-24 from five
+// independent source addresses, two identities and every advertised model — all
+// of them byte-identical and counting down to the same reset.
+const freeUsageLimitBody = `{"type":"error","error":{"type":"FreeUsageLimitError",` +
+	`"message":"Free usage limit reached. Subscribe to OpenCode Go to keep going: https://opencode.ai/go"}}`
+
+func newFreeBudgetGateway(t *testing.T, server *httptest.Server, exits int) *Gateway {
+	t.Helper()
+	addresses := make([]string, exits)
+	for i := range addresses {
+		addresses[i] = server.URL
+	}
+	gateway := &Gateway{
+		cfg: config.Config{
+			Upstream: config.UpstreamConfig{Zen: server.URL},
+			Retry:    config.RetryConfig{MaxAttempts: 3, TimeoutSeconds: 30},
+		},
+		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		anonymous: newTestAnonymousPool(t, addresses),
+	}
+	// Keep the reachability recheck out of these tests: it talks to the network
+	// and says nothing about the walk under test.
+	for _, node := range gateway.anonymous.nodes {
+		node.proxy.checking.Store(true)
+	}
+	return gateway
+}
+
+// A spent free budget is the lane's one credential speaking, not the exit that
+// delivered the body: the first answer already covers every exit. Walking the
+// pool instead spends one request per exit against the budget that is gone —
+// on 2026-10-24 the lane answered 439 client requests with 429 over six hours
+// and walked the pool for each of them.
+func TestAnonymousStopsAtSpentFreeBudget(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "44521")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, freeUsageLimitBody)
+	}))
+	defer server.Close()
+
+	gateway := newFreeBudgetGateway(t, server, 3)
+	ids := identity.RequestIDs{Session: "ses_16c1e0f5b0018", Request: "msg_16c1e0f5b0018", Project: "global"}
+	bodies := map[config.Tier][]byte{config.TierZen: []byte(
+		`{"model":"deepseek-v4.1-flash-free","stream":true,"messages":[{"role":"user","content":"hi"}]}`)}
+	route := models.Route{ID: "deepseek-v4.1-flash-free", Tier: config.TierZen, Protocol: wire.Chat}
+
+	resp, err, attempts := gateway.doAnonymousUpstream(context.Background(), route, bodies, ids, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("no response")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want the upstream 429 handed back", resp.StatusCode)
+	}
+	if attempts != 1 || hits.Load() != 1 {
+		t.Fatalf("attempts = %d, upstream hits = %d, want exactly one probe", attempts, hits.Load())
+	}
+
+	recorded, ok := gateway.anonymous.Refusal(time.Now())
+	if !ok {
+		t.Fatal("a spent budget must be recorded for the lane, not only for the exit that reported it")
+	}
+	if !recorded.ExhaustedBudget() {
+		t.Fatalf("recorded body = %q, want the free usage limit document", recorded.body)
+	}
+	if recorded.retryAfter == "" {
+		t.Fatal("the record must keep upstream's reset window so clients learn when to come back")
+	}
+}
+
+// Once the budget verdict is recorded it answers for the lane until upstream's
+// reset, without probing an exit at all — including while exits the stopped walk
+// never touched are still available and would otherwise be walked.
+func TestSpentFreeBudgetAnswersLaterRequestsFromTheRecord(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "44521")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, freeUsageLimitBody)
+	}))
+	defer server.Close()
+
+	gateway := newFreeBudgetGateway(t, server, 3)
+	bodies := map[config.Tier][]byte{config.TierZen: []byte(
+		`{"model":"deepseek-v4.1-flash-free","stream":true,"messages":[{"role":"user","content":"hi"}]}`)}
+	route := models.Route{ID: "deepseek-v4.1-flash-free", Tier: config.TierZen, Protocol: wire.Chat}
+
+	first := identity.RequestIDs{Session: "ses_16c1e0f5b0019", Request: "msg_16c1e0f5b0019", Project: "global"}
+	if resp, _, _ := gateway.doAnonymousUpstream(context.Background(), route, bodies, first, 0); resp != nil {
+		_ = resp.Body.Close()
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("upstream saw %d requests, want 1 probe before the record exists", got)
+	}
+
+	second := identity.RequestIDs{Session: "ses_16c1e0f5b001a", Request: "msg_16c1e0f5b001a", Project: "global"}
+	resp, err, attempts := gateway.doAnonymousUpstream(context.Background(), route, bodies, second, 0)
+	if err != nil {
+		t.Fatalf("replaying the recorded budget failure failed: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("replaying the recorded budget failure returned no response")
+	}
+	defer resp.Body.Close()
+	if attempts != 0 || hits.Load() != 1 {
+		t.Fatalf("attempts = %d, upstream hits = %d, want the record replayed without a probe", attempts, hits.Load())
+	}
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want the recorded 429", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Retry-After"); got == "" {
+		t.Fatal("a replayed refusal must still tell the client when the budget resets")
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading the replayed body failed: %v", err)
+	}
+	if !strings.Contains(string(body), freeUsageLimitMarker) {
+		t.Fatalf("replayed body = %q, want the upstream free usage limit document", body)
+	}
+}
+
+// A plain rate limit is one exit's own answer — a different exit is a different
+// connection and may serve — so it keeps rotating instead of stopping the walk.
+func TestPlainRateLimitStillRotatesPastTheExit(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if hits.Add(1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, rateLimitBody)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"chatcmpl_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	}))
+	defer server.Close()
+
+	gateway := newFreeBudgetGateway(t, server, 2)
+	ids := identity.RequestIDs{Session: "ses_16c1e0f5b001b", Request: "msg_16c1e0f5b001b", Project: "global"}
+	bodies := map[config.Tier][]byte{config.TierZen: []byte(
+		`{"model":"deepseek-v4.1-flash-free","stream":true,"messages":[{"role":"user","content":"hi"}]}`)}
+	route := models.Route{ID: "deepseek-v4.1-flash-free", Tier: config.TierZen, Protocol: wire.Chat}
+
+	resp, err, attempts := gateway.doAnonymousUpstream(context.Background(), route, bodies, ids, 0)
+	if err != nil {
+		t.Fatalf("walking past a rate limit failed: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("no response after walking past a rate limit")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want the next exit's 200: a plain rate limit must not stop the walk", resp.StatusCode)
+	}
+	if attempts != 2 || hits.Load() != 2 {
+		t.Fatalf("attempts = %d, upstream hits = %d, want the second exit tried", attempts, hits.Load())
+	}
+}
+
+// The client has to be able to tell a spent budget from a throttled call, so the
+// upstream's own error type survives the error document the gateway writes.
+func TestErrorResponseKeepsUpstreamType(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	copyErrorResponse(recorder, wire.Chat, &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     http.Header{"Retry-After": []string{"44521"}},
+		Body:       io.NopCloser(strings.NewReader(freeUsageLimitBody)),
+	}, "msg_16c1e0f5b001c")
+
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusTooManyRequests)
+	}
+	if got := recorder.Header().Get("Retry-After"); got != "44521" {
+		t.Fatalf("Retry-After = %q, want the upstream window", got)
+	}
+	var document struct {
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &document); err != nil {
+		t.Fatalf("decoding the error document failed: %v", err)
+	}
+	if document.Error.Type != freeUsageLimitMarker {
+		t.Fatalf("error type = %q, want %q", document.Error.Type, freeUsageLimitMarker)
+	}
+	if !strings.Contains(document.Error.Message, "Free usage limit reached") {
+		t.Fatalf("error message = %q, want upstream's message", document.Error.Message)
+	}
+
+	// A document with no type of its own keeps the generic name.
+	plain := httptest.NewRecorder()
+	copyErrorResponse(plain, wire.Chat, &http.Response{
+		StatusCode: http.StatusBadGateway,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader(`{"message":"boom"}`)),
+	}, "msg_16c1e0f5b001d")
+	var fallback struct {
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(plain.Body.Bytes(), &fallback); err != nil {
+		t.Fatalf("decoding the fallback document failed: %v", err)
+	}
+	if fallback.Error.Type != "upstream_error" {
+		t.Fatalf("error type = %q, want upstream_error", fallback.Error.Type)
 	}
 }

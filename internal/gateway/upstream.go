@@ -228,6 +228,18 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	// downstream client asked for a plain JSON reply. Key tiers keep their
 	// original bodies.
 	body = prepareAnonymousBody(body, route.ProtocolFor(config.TierZen))
+	// A spent free budget is not an exit's opinion: it is the lane's one
+	// credential reporting that nothing will be served until the reset upstream
+	// named. The record carries that reset, so the lane answers from it without
+	// probing — a probe would spend a request against the budget that is already
+	// gone and could only deliver this same body back. It is checked before the
+	// walk rather than only when every exit is cooling, because the exits a
+	// stopped walk never touched are still available and would be probed.
+	if refusal, refused := g.anonymous.Refusal(time.Now()); refused && refusal.ExhaustedBudget() {
+		setRequestCredential(ctx, config.TierZen, "anonymous", "anonymous", true, nil)
+		g.logger.Debug("anonymous free budget still spent; answering from the record", "component", "upstream", "event", "anonymous_refusal_replayed", "request_id", ids.Request, "status", refusal.status, "retry_after", refusal.retryAfter, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "reason", "free_budget_spent")
+		return refusalResponse(refusal), nil, 0
+	}
 	// A refusal from a proxy exit only speaks for that exit, so the lane rotates
 	// past it. When every exit has refused and the whole pool is cooling there is
 	// nothing left to rotate onto: at that point the refusal has described every
@@ -348,15 +360,30 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		// the next exit may well succeed — recording it lane-wide would refuse
 		// traffic a working exit could have served.
 		refusal, laneRefusal := anonymousLaneRefusal(resp)
-		laneWide := laneRefusal && laneLevelVerdict(node.proxy)
+		// Two verdicts speak for the whole lane whatever exit carried them: one
+		// about the address the gateway owns (laneLevelVerdict), and one about the
+		// credential, which every exit shares by definition. The second is the free
+		// tier's spent budget — five independent source addresses, two identities
+		// and every model collected it verbatim, so rotating onto another exit
+		// spends a probe to receive the same body again.
+		laneWide := laneRefusal && (laneLevelVerdict(node.proxy) || refusal.ExhaustedBudget())
 		if laneWide {
 			if recorded := g.anonymous.RecordRefusal(now, refusal.status, refusal.retryAfter, refusal.body); recorded {
-				g.logger.Warn("anonymous lane refused by upstream", "component", "upstream", "event", "anonymous_lane_refused", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "status", refusal.status, "retry_after", refusal.retryAfter, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds())
+				g.logger.Warn("anonymous lane refused by upstream", "component", "upstream", "event", "anonymous_lane_refused", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "status", refusal.status, "retry_after", refusal.retryAfter, "free_budget_spent", refusal.ExhaustedBudget(), "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds())
 			}
 		} else if laneRefusal {
 			held := refusal
 			lastRefusal = &held
 			g.logger.Debug("exit refused the request; rotating to another egress", "component", "upstream", "event", "anonymous_exit_refused", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "status", refusal.status, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds())
+		}
+		if laneWide && refusal.ExhaustedBudget() {
+			// One probe is the whole investigation: the budget belongs to the
+			// lane's credential, so every remaining exit answers with this same
+			// body and the same countdown. Walking the pool here is what makes a
+			// spent budget cost the pool size in requests per client request —
+			// traffic upstream counts against the budget that is already gone.
+			g.logger.Debug("anonymous free budget spent; recording it and stopping rotation", "component", "upstream", "event", "anonymous_free_budget_exhausted", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "status", refusal.status, "retry_after", refusal.retryAfter, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds())
+			return resp, nil, attempts
 		}
 		if isNonRetryableClientResponse(resp, err) {
 			g.logger.Debug("anonymous upstream rejected a non-retryable request", "component", "upstream", "event", "anonymous_attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "status", resp.StatusCode, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds())

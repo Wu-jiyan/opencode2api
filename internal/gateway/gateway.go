@@ -566,11 +566,37 @@ func copyErrorResponse(w http.ResponseWriter, protocol wire.Protocol, resp *http
 		w.Header().Set("Retry-After", retryAfter)
 	}
 	message := http.StatusText(resp.StatusCode)
+	kind := "upstream_error"
 	var value map[string]any
 	if json.Unmarshal(body, &value) == nil {
 		message = jsonutil.FirstString(jsonutil.StringAt(value, "error", "message"), jsonutil.StringAt(value, "message"), message)
+		kind = upstreamErrorKind(value, kind)
 	}
-	wire.WriteError(w, protocol, resp.StatusCode, message, "upstream_error", requestID)
+	wire.WriteError(w, protocol, resp.StatusCode, message, kind, requestID)
+}
+
+// upstreamErrorKind keeps the upstream's own error type when it names one.
+//
+// The free tier reports a spent budget as
+//
+//	{"type":"error","error":{"type":"FreeUsageLimitError","message":"Free usage
+//	 limit reached. Subscribe to OpenCode Go to keep going: …"}}
+//
+// Collapsing that name into the generic "upstream_error" threw away the one
+// token that separates "this call was throttled" from "nothing on this
+// credential will be served until the reset", so the 2026-10-24 outage reached
+// clients as an unnamed 429 and cost a manual investigation to identify. A bare
+// top-level "error" is the document envelope, not a type, so it does not count
+// as a name.
+func upstreamErrorKind(value map[string]any, fallback string) string {
+	kind := jsonutil.FirstString(
+		jsonutil.StringAt(value, "error", "type"),
+		jsonutil.StringAt(value, "type"),
+	)
+	if kind == "" || kind == "error" {
+		return fallback
+	}
+	return kind
 }
 
 // isRestartableStreamRead reports whether an error from consuming an upstream

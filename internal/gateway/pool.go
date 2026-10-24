@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -114,6 +115,36 @@ type anonymousRefusal struct {
 // anonymousRefusalBodyLimit bounds how much of a refusal is kept. Enough for the
 // JSON error document, small enough that the record costs nothing.
 const anonymousRefusalBodyLimit = 4096
+
+// freeUsageLimitMarker identifies the answer upstream gives when the free tier's
+// shared budget is spent:
+//
+//	429 {"type":"error","error":{"type":"FreeUsageLimitError","message":"Free
+//	     usage limit reached. Subscribe to OpenCode Go to keep going: …
+//	     https://opencode.ai/go"}}
+//
+// Unlike a rate limit, this verdict does not belong to the exit that delivered
+// it. Measured 2026-10-24 with byte-identical requests, changing one variable at
+// a time:
+//
+//	production IPv4 (108.186.246.70)       -> 429 FreeUsageLimitError
+//	production pinned IPv6 (…:1300::2)     -> 429 FreeUsageLimitError
+//	two Cloudflare egresses (socks5 exits) -> 429 FreeUsageLimitError
+//	a VPS in another country, other /32    -> 429 FreeUsageLimitError
+//	two fresh project identities           -> 429 FreeUsageLimitError
+//	every advertised model                 -> 429 FreeUsageLimitError
+//
+// All of them carried the same countdown to the same reset instant, so the
+// budget follows the lane's single "public" credential — not the source address,
+// not the identity, not the model. That is what makes the next exit a wasted
+// probe: it can only deliver this same answer.
+const freeUsageLimitMarker = "FreeUsageLimitError"
+
+// ExhaustedBudget reports whether the refusal says the free tier's shared budget
+// is spent, as opposed to describing what one exit saw.
+func (r anonymousRefusal) ExhaustedBudget() bool {
+	return bytes.Contains(r.body, []byte(freeUsageLimitMarker))
+}
 
 type anonymousCursor struct {
 	pool   *anonymousPool
